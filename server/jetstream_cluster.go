@@ -8879,7 +8879,6 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 					}
 
 					// TODO(mvv): docs, preserve peers but optionally need to change the name if scaling up/to R1
-					// FIXME(mvv): should this still be done when scaling down to R1?
 					desiredGroup := cca.Group
 					desiredGroup.Desired = nil // leaf invariant: desired groups never nest
 					cca.Group = ca.Group.copyGroup()
@@ -8939,7 +8938,6 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 			}
 
 			// TODO(mvv): docs, preserve peers but optionally need to change the name if scaling up/to R1
-			// FIXME(mvv): should this still be done when scaling down to R1?
 			desiredGroup := cca.Group
 			desiredGroup.Desired = nil // leaf invariant: desired groups never nest
 			cca.Group = ca.Group.copyGroup()
@@ -8970,7 +8968,6 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 	}
 	sa := &streamAssignment{Group: osa.Group, Sync: syncSubject, Created: osa.Created, Config: newCfg, Subject: subject, Reply: reply, Client: ci}
 	if isMoveRequest || isReplicaChange {
-		// FIXME(mvv): should this still be done when scaling down to R1?
 		// Set the desired state.
 		rg.Desired = nil // leaf invariant: desired groups never nest
 		sa.Group = osa.Group.copyGroup()
@@ -10092,7 +10089,6 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 		nca.Reply = reply
 
 		if rBefore != rAfter {
-			// FIXME(mvv): should this still be done when scaling down to R1?
 			desiredGroup := nca.Group
 			desiredGroup.Desired = nil // leaf invariant: desired groups never nest
 			nca.Group = ca.Group.copyGroup()
