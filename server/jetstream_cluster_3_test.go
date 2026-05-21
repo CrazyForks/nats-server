@@ -11052,3 +11052,144 @@ func TestJetStreamClusterConsumerScaleDownPrefersOnlinePeers(t *testing.T) {
 		}
 	}
 }
+
+func TestJetStreamClusterR1ConsumerOfflineDuringStreamScaleDown(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	// R3 stream.
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	// Publish a batch of messages.
+	const total = 10
+	for range total {
+		_, err = js.Publish("foo", nil)
+		require_NoError(t, err)
+	}
+
+	// R1 durable pull consumer.
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:       "C",
+		FilterSubject: "foo",
+		AckPolicy:     nats.AckExplicitPolicy,
+		Replicas:      1,
+	})
+	require_NoError(t, err)
+
+	// Ensure the stream leader and consumer leader live on different servers. The
+	// stream is R3 (present on all three servers), so we step the stream leader off
+	// the consumer leader's server if they happen to coincide. Note we can't relocate
+	// the R1 consumer via stepdown, as its raft group only has a single peer.
+	checkFor(t, 10*time.Second, 200*time.Millisecond, func() error {
+		sl := c.streamLeader(globalAccountName, "TEST")
+		cl := c.consumerLeader(globalAccountName, "TEST", "C")
+		if sl == nil || cl == nil {
+			return fmt.Errorf("missing leader (stream=%v consumer=%v)", sl, cl)
+		}
+		if sl == cl {
+			_, err = nc.Request(fmt.Sprintf(JSApiStreamLeaderStepDownT, "TEST"), nil, time.Second)
+			require_NoError(t, err)
+			c.waitOnStreamLeader(globalAccountName, "TEST")
+			return fmt.Errorf("stream leader still co-located with consumer leader")
+		}
+		return nil
+	})
+
+	sl := c.streamLeader(globalAccountName, "TEST")
+	cl := c.consumerLeader(globalAccountName, "TEST", "C")
+	require_True(t, sl != cl)
+
+	// Consume and ack half of the messages so the consumer has non-trivial state.
+	const acked = 5
+	sub, err := js.PullSubscribe("foo", "C", nats.BindStream("TEST"))
+	require_NoError(t, err)
+	msgs, err := sub.Fetch(acked, nats.MaxWait(5*time.Second))
+	require_NoError(t, err)
+	require_Equal(t, len(msgs), acked)
+	for _, m := range msgs {
+		require_NoError(t, m.AckSync())
+	}
+
+	// Capture the consumer state before we take its only replica offline.
+	ciBefore, err := js.ConsumerInfo("TEST", "C")
+	require_NoError(t, err)
+	require_Equal(t, ciBefore.AckFloor.Consumer, acked)
+	require_Equal(t, ciBefore.AckFloor.Stream, acked)
+	require_Equal(t, ciBefore.NumPending, total-acked)
+
+	// Shut down the server hosting the (R1) consumer leader. Its only replica of the
+	// consumer state is now gone.
+	cl.Shutdown()
+	cl.WaitForShutdown()
+	c.waitOnLeader()
+
+	// Reconnect to the stream leader.
+	nc.Close()
+	nc, js = jsClientConnect(t, sl)
+	defer nc.Close()
+
+	// Scale the stream down from R3 to R1. R1 keeps the (still online) stream leader
+	// and drops the other two peers, including the offline server. The consumer, which
+	// lived only on that offline server, must now be relocated onto a surviving server.
+	_, err = js.UpdateStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 1,
+	})
+	require_NoError(t, err)
+
+	// Restart the server we shut down, a couple seconds after scaling down. Do this
+	// asynchronously, before waiting on leadership below: the R1 consumer's only copy
+	// of its acked state lived on that server, so the scale-down can only settle once
+	// it is back online to hand its state over.
+	restartIndex := slices.IndexFunc(c.servers, func(s *Server) bool { return s == cl })
+	restartOpts := c.opts[restartIndex]
+	var wg sync.WaitGroup
+	wg.Add(1)
+	defer func() {
+		wg.Wait()
+		cl.Shutdown()
+	}()
+	go func() {
+		defer wg.Done()
+		time.Sleep(4 * time.Second)
+		cl, _ = RunServerWithConfig(restartOpts.ConfigFile)
+	}()
+
+	c.waitOnStreamLeader(globalAccountName, "TEST")
+
+	// Wait for the consumer to come back with a leader on a surviving server.
+	c.waitOnConsumerLeader(globalAccountName, "TEST", "C")
+	ncl := c.consumerLeader(globalAccountName, "TEST", "C")
+	require_True(t, ncl != cl)
+
+	// The key question: did the relocated consumer keep its acked state, or did it
+	// lose it (resetting the ack floor and redelivering already-acked messages)?
+	ciAfter, err := js.ConsumerInfo("TEST", "C")
+	require_NoError(t, err)
+	require_Equal(t, ciAfter.AckFloor.Consumer, acked)
+	require_Equal(t, ciAfter.AckFloor.Stream, acked)
+	require_Equal(t, ciAfter.NumPending, total-acked)
+
+	// Concretely: re-fetching must only deliver the un-acked remainder, never the
+	// messages we already acked.
+	sub, err = js.PullSubscribe("foo", "C", nats.BindStream("TEST"))
+	require_NoError(t, err)
+	msgs, err = sub.Fetch(total-acked, nats.MaxWait(5*time.Second))
+	require_NoError(t, err)
+	require_Equal(t, len(msgs), total-acked)
+	for _, m := range msgs {
+		meta, err := m.Metadata()
+		require_NoError(t, err)
+		require_True(t, meta.Sequence.Stream > acked)
+		require_NoError(t, m.AckSync())
+	}
+}

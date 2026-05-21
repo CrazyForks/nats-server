@@ -6399,7 +6399,7 @@ func (js *jetStream) processClusterCreateConsumer(oca, ca *consumerAssignment, s
 				needsLocalResponse = true
 			}
 			// If we look like we are scaling up, let's send our current state to the group.
-			sendState = len(ca.Group.Peers) > len(oca.Group.Peers) && o.IsLeader() && n != nil
+			sendState = (len(ca.Group.Peers) > len(oca.Group.Peers) || ca.Group.Desired != nil) && o.IsLeader() && n != nil
 			// Signal that this is an update
 			if ca.Reply != _EMPTY_ {
 				isConfigUpdate = true
@@ -7705,6 +7705,7 @@ func (js *jetStream) processStreamAssignmentUpdates(sub *subscription, c *client
 		newCfg := *sa.Config
 		newCfg.Placement = osa.Group.Desired.Placement
 		sa.Config = &newCfg
+		// TODO(mvv): should this always be done, even if not an exact match?
 		sa.Group = sa.Group.Desired.Group
 		// Promoted group is now the current state; clear any desired marker.
 		sa.Group.Desired = nil
@@ -7756,6 +7757,7 @@ func (js *jetStream) processConsumerAssignmentUpdates(sub *subscription, c *clie
 	ca.Reply = _EMPTY_
 	if exactMatch {
 		// If it's an exact match, promote the desired placement to be the group.
+		// TODO(mvv): should this always be done, even if not an exact match?
 		ca.Group = ca.Group.Desired.Group
 		// Promoted group is now the current state; clear any desired marker.
 		ca.Group.Desired = nil
@@ -8903,13 +8905,15 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 						js.mu.Lock()
 					}
 
-					//// TODO(mvv): docs, preserve peers but optionally need to change the name if scaling up/to R1
-					//// FIXME(mvv): should this still be done when scaling down to R1?
-					//cca.DesiredPlacement = &desiredGroupPlacement{
-					//	ID:    nuid.Next(),
-					//	Group: cca.Group,
-					//}
-					//cca.Group = ca.Group
+					// TODO(mvv): docs, preserve peers but optionally need to change the name if scaling up/to R1
+					// FIXME(mvv): should this still be done when scaling down to R1?
+					desiredGroup := cca.Group
+					desiredGroup.Desired = nil // leaf invariant: desired groups never nest
+					cca.Group = ca.Group.copyGroup()
+					cca.Group.Desired = &desiredGroupPlacement{
+						ID:    nuid.Next(),
+						Group: desiredGroup,
+					}
 
 					// We can not propose here before the stream itself so we collect them.
 					consumers = append(consumers, cca)
@@ -9020,8 +9024,9 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 
 	// Process any staged consumers.
 	for _, ca := range consumers {
-		meta.Propose(encodeAddConsumerAssignment(ca))
-		cc.trackInflightConsumerProposal(acc.Name, sa.Config.Name, ca, false)
+		if err := meta.Propose(encodeAddConsumerAssignment(ca)); err == nil {
+			cc.trackInflightConsumerProposal(acc.Name, sa.Config.Name, ca, false)
+		}
 	}
 }
 
