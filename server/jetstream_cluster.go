@@ -3617,16 +3617,14 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 			// We want to know if we are migrating.
 			migrating := mset.isMigrating()
 			if isLeader && migrating {
-				if mmtc == nil {
+				// Run immediately, but reset the timer.
+				stop := js.runStreamMigration(mset, sa, n)
+				if stop {
+					stopMigrationMonitoring()
+				} else if mmtc == nil {
 					startMigrationMonitoring()
 				} else {
-					// Run immediately, but reset the timer.
-					stop := js.runStreamMigration(mset, sa, n)
-					if stop {
-						stopMigrationMonitoring()
-					} else {
-						mmt.Reset(mmtd)
-					}
+					mmt.Reset(mmtd)
 				}
 			} else {
 				stopMigrationMonitoring()
@@ -7008,16 +7006,14 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 			// We want to know if we are migrating.
 			migrating := o.isMigrating()
 			if isLeader && migrating {
-				if mmtc == nil {
+				// Run immediately, but reset the timer.
+				stop := js.runConsumerMigration(o, ca, n)
+				if stop {
+					stopMigrationMonitoring()
+				} else if mmtc == nil {
 					startMigrationMonitoring()
 				} else {
-					// Run immediately, but reset the timer.
-					stop := js.runConsumerMigration(o, ca, n)
-					if stop {
-						stopMigrationMonitoring()
-					} else {
-						mmt.Reset(mmtd)
-					}
+					mmt.Reset(mmtd)
 				}
 			} else {
 				stopMigrationMonitoring()
@@ -8845,6 +8841,16 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 				if cca.Config.Replicas != 0 {
 					cca.Config.Replicas = len(rg.Peers)
 				}
+
+				// TODO(mvv): docs, preserve peers but optionally need to change the name if scaling up/to R1
+				desiredGroup := cca.Group
+				desiredGroup.Desired = nil // leaf invariant: desired groups never nest
+				cca.Group = ca.Group.copyGroup()
+				cca.Group.Desired = &desiredGroupPlacement{
+					ID:    nuid.Next(),
+					Group: desiredGroup,
+				}
+
 				// We can not propose here before the stream itself so we collect them.
 				consumers = append(consumers, cca)
 

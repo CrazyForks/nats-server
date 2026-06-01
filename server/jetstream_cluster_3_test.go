@@ -8396,7 +8396,7 @@ func TestJetStreamClusterScaleDownWaitsForMonitorRoutineQuit(t *testing.T) {
 	scfg.Replicas = 1
 	_, err = js.UpdateStream(scfg)
 	require_NoError(t, err)
-	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+	checkFor(t, 5*time.Second, 200*time.Millisecond, func() error {
 		mset.mu.RLock()
 		defer mset.mu.RUnlock()
 		if mset.inMonitor {

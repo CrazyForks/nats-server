@@ -4197,6 +4197,7 @@ func TestJetStreamClusterScaleConsumer(t *testing.T) {
 			}
 			return nil
 		})
+		c.waitOnConsumerLeader(globalAccountName, "TEST", "DUR")
 
 		require_NoError(t, consumeOne(uint64(i+1)))
 	}
