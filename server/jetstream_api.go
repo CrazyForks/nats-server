@@ -2628,15 +2628,12 @@ func (s *Server) jsLeaderServerStreamMoveRequest(sub *subscription, c *client, _
 	currPeers := []string{}
 	currCluster := _EMPTY_
 	js.mu.Lock()
-	streams, ok := cc.streams[accName]
-	if ok {
-		sa, ok := streams[streamName]
-		if ok {
-			cfg = *sa.Config.clone()
-			streamFound = true
-			currPeers = sa.Group.Peers
-			currCluster = sa.Group.Cluster
-		}
+	sa := js.streamAssignmentOrInflight(accName, streamName)
+	if sa != nil {
+		cfg = *sa.Config.clone()
+		streamFound = true
+		currPeers = sa.Group.Peers
+		currCluster = sa.Group.Cluster
 	}
 	js.mu.Unlock()
 
@@ -2716,6 +2713,9 @@ func (s *Server) jsLeaderServerStreamMoveRequest(sub *subscription, c *client, _
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
+	} else {
+		// Keep only the new peers.
+		peers = peers[len(peers)-cfg.Replicas:]
 	}
 
 	cfg.Placement = origPlacement
