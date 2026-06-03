@@ -2862,18 +2862,15 @@ func (s *Server) jsLeaderServerStreamMoveRequest(sub *subscription, c *client, _
 	cfg := StreamConfig{}
 	currPeers := []string{}
 	currCluster := _EMPTY_
-	js.mu.Lock()
-	streams, ok := cc.streams[accName]
-	if ok {
-		sa, ok := streams[streamName]
-		if ok {
-			cfg = *sa.Config.clone()
-			streamFound = true
-			currPeers = sa.Group.Peers
-			currCluster = sa.Group.Cluster
-		}
+	js.mu.RLock()
+	sa := js.streamAssignmentOrInflight(accName, streamName)
+	if sa != nil {
+		cfg = *sa.Config.clone()
+		streamFound = true
+		currPeers = copyStrings(sa.Group.Peers)
+		currCluster = sa.Group.Cluster
 	}
-	js.mu.Unlock()
+	js.mu.RUnlock()
 
 	if !streamFound {
 		resp.Error = NewJSStreamNotFoundError()
@@ -3013,17 +3010,14 @@ func (s *Server) jsLeaderServerStreamCancelMoveRequest(sub *subscription, c *cli
 	streamFound := false
 	cfg := StreamConfig{}
 	currPeers := []string{}
-	js.mu.Lock()
-	streams, ok := cc.streams[accName]
-	if ok {
-		sa, ok := streams[streamName]
-		if ok {
-			cfg = *sa.Config.clone()
-			streamFound = true
-			currPeers = sa.Group.Peers
-		}
+	js.mu.RLock()
+	sa := js.streamAssignmentOrInflight(accName, streamName)
+	if sa != nil {
+		cfg = *sa.Config.clone()
+		streamFound = true
+		currPeers = copyStrings(sa.Group.Peers)
 	}
-	js.mu.Unlock()
+	js.mu.RUnlock()
 
 	if !streamFound {
 		resp.Error = NewJSStreamNotFoundError()
