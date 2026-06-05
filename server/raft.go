@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -67,7 +68,7 @@ type RaftNode interface {
 	Group() string
 	Peers() []*Peer
 	ProposeKnownPeers(knownPeers []string)
-	UpdateKnownPeers(knownPeers []string)
+	UpdateAllowedPeers(knownPeers []string)
 	ProposeAddPeer(peer string) error
 	ProposeRemovePeer(peer string) error
 	MembershipChangeInProgress() bool
@@ -179,6 +180,8 @@ type raft struct {
 	acks    map[uint64]map[string]struct{} // Append entry responses/acks, map of entry index -> peer ID
 	pae     map[uint64]*appendEntry        // Pending append entries
 
+	allowed []string // Which peers are allowed to be in the group.
+
 	elect  *time.Timer // Election timer, normally accessed via electTimer
 	etlr   time.Time   // Election timer last reset time, for unit tests only
 	active time.Time   // Last activity time, i.e. for heartbeats
@@ -284,27 +287,29 @@ type membChange struct {
 }
 
 const (
-	minElectionTimeoutDefault      = 4 * time.Second
-	maxElectionTimeoutDefault      = 9 * time.Second
-	minCampaignTimeoutDefault      = 100 * time.Millisecond
-	maxCampaignTimeoutDefault      = 8 * minCampaignTimeoutDefault
-	hbIntervalDefault              = 1 * time.Second
-	lostQuorumIntervalDefault      = hbIntervalDefault * 10 // 10 seconds
-	lostQuorumCheckIntervalDefault = hbIntervalDefault * 10 // 10 seconds
-	observerModeIntervalDefault    = 48 * time.Hour
-	peerRemoveTimeoutDefault       = 5 * time.Minute
+	minElectionTimeoutDefault       = 4 * time.Second
+	maxElectionTimeoutDefault       = 9 * time.Second
+	minCampaignTimeoutDefault       = 100 * time.Millisecond
+	maxCampaignTimeoutDefault       = 8 * minCampaignTimeoutDefault
+	hbIntervalDefault               = 1 * time.Second
+	lostQuorumIntervalDefault       = hbIntervalDefault * 10 // 10 seconds
+	lostQuorumCheckIntervalDefault  = hbIntervalDefault * 10 // 10 seconds
+	observerModeIntervalDefault     = 48 * time.Hour
+	peerRemoveTimeoutDefault        = 5 * time.Minute
+	peerRemoveAllowedTimeoutDefault = 5 * time.Second
 )
 
 var (
-	minElectionTimeout   = minElectionTimeoutDefault
-	maxElectionTimeout   = maxElectionTimeoutDefault
-	minCampaignTimeout   = minCampaignTimeoutDefault
-	maxCampaignTimeout   = maxCampaignTimeoutDefault
-	hbInterval           = hbIntervalDefault
-	lostQuorumInterval   = lostQuorumIntervalDefault
-	lostQuorumCheck      = lostQuorumCheckIntervalDefault
-	observerModeInterval = observerModeIntervalDefault
-	peerRemoveTimeout    = peerRemoveTimeoutDefault
+	minElectionTimeout       = minElectionTimeoutDefault
+	maxElectionTimeout       = maxElectionTimeoutDefault
+	minCampaignTimeout       = minCampaignTimeoutDefault
+	maxCampaignTimeout       = maxCampaignTimeoutDefault
+	hbInterval               = hbIntervalDefault
+	lostQuorumInterval       = lostQuorumIntervalDefault
+	lostQuorumCheck          = lostQuorumCheckIntervalDefault
+	observerModeInterval     = observerModeIntervalDefault
+	peerRemoveTimeout        = peerRemoveTimeoutDefault
+	peerRemoveAllowedTimeout = peerRemoveAllowedTimeoutDefault
 )
 
 type RaftConfig struct {
@@ -350,6 +355,7 @@ var (
 	errMembershipChange  = errors.New("raft: membership change in progress")
 	errRemoveLastNode    = errors.New("raft: cannot remove the last peer")
 	errPeerNotFound      = errors.New("raft: peer not found")
+	errPeerNotTracked    = errors.New("raft: peer not tracked")
 )
 
 // This will bootstrap a raftNode by writing its config into the store directory.
@@ -2185,21 +2191,17 @@ func (n *raft) ProposeKnownPeers(knownPeers []string) {
 	if n.State() != Leader {
 		return
 	}
-	n.updateKnownPeersLocked(knownPeers)
-	n.sendPeerState()
-}
-
-// Update our known set of peers.
-func (n *raft) UpdateKnownPeers(knownPeers []string) {
-	n.Lock()
-	n.updateKnownPeersLocked(knownPeers)
-	n.Unlock()
-}
-
-func (n *raft) updateKnownPeersLocked(knownPeers []string) {
 	// Process like peer state update.
 	ps := &peerState{knownPeers, len(knownPeers), n.extSt}
 	n.processPeerState(ps)
+	n.sendPeerState()
+}
+
+// Update our allowed set of peers.
+func (n *raft) UpdateAllowedPeers(allowedPeers []string) {
+	n.Lock()
+	defer n.Unlock()
+	n.allowed = allowedPeers
 }
 
 // ApplyQ returns the apply queue that new commits will be sent to for the
@@ -3767,26 +3769,39 @@ func (n *raft) trackPeer(peer string) error {
 	n.Lock()
 	var needPeerAdd, isRemoved bool
 	var rts time.Time
-	if n.removed != nil {
-		rts, isRemoved = n.removed[peer]
-		// Removed peers can rejoin after timeout.
-		if isRemoved && time.Since(rts) >= peerRemoveTimeout {
-			isRemoved = false
-		}
-	}
 	if n.State() == Leader {
+		if n.removed != nil {
+			rts, isRemoved = n.removed[peer]
+			// Removed peers can rejoin after timeout.
+			if isRemoved {
+				timeout := peerRemoveTimeout
+				if n.allowed != nil && slices.Contains(n.allowed, peer) {
+					timeout = peerRemoveAllowedTimeout
+				}
+				if time.Since(rts) >= timeout {
+					isRemoved = false
+				}
+			}
+		}
 		if _, ok := n.peers[peer]; !ok {
 			// Check if this peer had been removed previously.
 			needPeerAdd = !isRemoved
 		}
+		// If a peer needs to be added, and we have an allowlist, the peer needs to be on it.
+		if needPeerAdd && n.allowed != nil {
+			needPeerAdd = slices.Contains(n.allowed, peer)
+		}
 	}
-	if ps := n.peers[peer]; ps != nil {
+	ps := n.peers[peer]
+	if ps != nil {
 		ps.ts = time.Now()
 	}
 	n.Unlock()
 
 	if needPeerAdd {
-		n.ProposeAddPeer(peer)
+		return n.ProposeAddPeer(peer)
+	} else if ps == nil {
+		return errPeerNotTracked
 	}
 	return nil
 }
@@ -5151,6 +5166,11 @@ func (n *raft) processVoteRequest(vr *voteRequest) error {
 
 	// Only way we get to yes is through here.
 	voteOk := n.vote == noVote || n.vote == vr.candidate
+
+	// If there's an allowed peer list, only allow voting on peers within the set.
+	if voteOk && n.allowed != nil {
+		voteOk = slices.Contains(n.allowed, vr.candidate)
+	}
 
 	// If we have an empty log, but are initializing.
 	if voteOk && vresp.empty && n.initializing {

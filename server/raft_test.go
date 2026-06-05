@@ -6744,3 +6744,79 @@ func TestNRGBootstrapExpectedClusterSize(t *testing.T) {
 		})
 	}
 }
+
+func TestNRGUpdateAllowedPeers(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	n.switchToLeader()
+	require_Equal(t, n.State(), Leader)
+
+	s1 := getHash("S-1")
+	s2 := getHash("S-2")
+	s3 := getHash("S-3")
+	s4 := getHash("S-4")
+	s5 := getHash("S-5")
+
+	// Normal tracking of a pre-existing peer.
+	require_Len(t, len(n.peers), 1)
+	p1 := n.peers[s1]
+	require_NotNil(t, p1)
+	ts := p1.ts
+	require_NoError(t, n.trackPeer(s1))
+	require_Len(t, len(n.peers), 1)
+	p1 = n.peers[s1]
+	require_NotNil(t, p1)
+	require_NotEqual(t, p1.ts, ts)
+
+	// Check allowlist doesn't allow adding new peers.
+	n.UpdateAllowedPeers([]string{s1})
+	require_NoError(t, n.trackPeer(s1))
+	require_Error(t, n.trackPeer(s2), errPeerNotTracked)
+	require_Error(t, n.trackPeer(s3), errPeerNotTracked)
+	require_Equal(t, n.prop.size(), 0)
+
+	// Check adding an allowed peer.
+	n.UpdateAllowedPeers([]string{s1, s2})
+	require_NoError(t, n.trackPeer(s2))
+	msgs := n.prop.pop()
+	require_Len(t, len(msgs), 1)
+	require_Equal(t, msgs[0].Type, EntryAddPeer)
+	require_Equal(t, string(msgs[0].Data), s2)
+
+	// Check not re-adding a removed peer.
+	n.removePeer(s2)
+	require_Len(t, len(n.removed), 1)
+	require_NotEqual(t, n.removed[s2], time.Time{})
+	require_Error(t, n.trackPeer(s2), errPeerNotTracked)
+
+	// Can't re-add a removed peer that's not on the allowlist anymore.
+	n.removed = nil
+	n.UpdateAllowedPeers([]string{s1})
+	require_Error(t, n.trackPeer(s2), errPeerNotTracked)
+
+	// Simulate the removed state still existing.
+	n.removed = map[string]time.Time{}
+	now := time.Now()
+	n.removed[s2] = now
+	n.removed[s3] = now
+
+	// If the allowlist allows, and the peer is peer-removed, it should shorten the timeout to re-add.
+	n.UpdateAllowedPeers([]string{s1, s2, s3})
+	require_Len(t, len(n.removed), 2)
+	require_Error(t, n.trackPeer(s3), errPeerNotTracked)
+	n.removed[s3] = now.Add(-5 * time.Second)
+	require_NoError(t, n.trackPeer(s3))
+	msgs = n.prop.pop()
+	require_Len(t, len(msgs), 1)
+	require_Equal(t, msgs[0].Type, EntryAddPeer)
+	require_Equal(t, string(msgs[0].Data), s3)
+
+	// A larger peer set remains intact when allowed peers are updated.
+	for _, peer := range []string{s1, s2, s3, s4, s5} {
+		n.addPeer(peer)
+	}
+	require_Len(t, len(n.peerNames()), 5)
+	n.UpdateAllowedPeers([]string{s1, s2, s3})
+	require_Len(t, len(n.peerNames()), 5)
+}

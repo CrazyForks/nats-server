@@ -1158,7 +1158,7 @@ func (mset *stream) setStreamAssignment(sa *streamAssignment) {
 		js.mu.RLock()
 		if sa.Group != nil {
 			node = sa.Group.node
-			peers = sa.Group.Peers
+			peers = copyStrings(sa.Group.Peers)
 		}
 		js.mu.RUnlock()
 	}
@@ -1174,7 +1174,7 @@ func (mset *stream) setStreamAssignment(sa *streamAssignment) {
 	// Set our node.
 	mset.node = node
 	if mset.node != nil {
-		mset.node.UpdateKnownPeers(peers)
+		mset.node.UpdateAllowedPeers(peers)
 	}
 
 	// Setup our info sub here as well for all stream members. This is now by design.

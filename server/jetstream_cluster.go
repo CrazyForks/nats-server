@@ -2954,7 +2954,7 @@ retry:
 			//    that could change the peerstate again, therefore the leader
 			//    should send out a new proposal anyway too just to make sure
 			//    that this change gets captured in the log.
-			node.UpdateKnownPeers(groupPeerIDs)
+			node.UpdateAllowedPeers(groupPeerIDs)
 
 			// If the peers changed as a result of an update by the meta layer, we must reflect that in the log of
 			// this group. Otherwise, a new peer would come up and instantly reset the peer state back to whatever is
