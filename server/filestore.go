@@ -2073,7 +2073,9 @@ func (fs *fileStore) recoverTTLState() error {
 		ttlseq, err = fs.ttls.Decode(buf)
 		if err != nil {
 			fs.warn("Error decoding TTL state: %s", err)
-			os.Remove(fn)
+			// Remove the file, and reset collected state (if any).
+			_ = os.Remove(fn)
+			fs.ttls = thw.NewHashWheel()
 		}
 	}
 
@@ -2158,7 +2160,9 @@ func (fs *fileStore) recoverMsgSchedulingState() error {
 		schedSeq, err = fs.scheduling.decode(buf)
 		if err != nil {
 			fs.warn("Error decoding message scheduling state: %s", err)
-			os.Remove(fn)
+			// Remove the file, and reset collected state (if any).
+			_ = os.Remove(fn)
+			fs.scheduling = newMsgScheduling(fs.runMsgScheduling)
 		}
 	}
 
