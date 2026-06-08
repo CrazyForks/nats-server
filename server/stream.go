@@ -4582,6 +4582,21 @@ func (mset *stream) setStartingSequenceForSources(iNames map[string]struct{}) {
 		return
 	}
 
+	// Collect known sources state and reuse where possible.
+	sourcesState := mset.store.SourcesState()
+	for iName := range iNames {
+		if sseq, ok := sourcesState[iName]; ok {
+			if si, ok := mset.sources[iName]; ok {
+				si.sseq = sseq
+				si.dseq = 0
+				delete(iNames, iName)
+			}
+		}
+	}
+	if len(iNames) == 0 {
+		return
+	}
+
 	// From the provided list of sources, we build a sublist that contains
 	// the interested filters (including transforms). As we figure out the
 	// starting sequence for each source, we will eliminate the source from
@@ -4618,7 +4633,7 @@ func (mset *stream) setStartingSequenceForSources(iNames map[string]struct{}) {
 	var smv StoreMsg
 	for last := state.LastSeq; ; {
 		sm, seq, err := mset.store.LoadPrevMsgMulti(sl, last, &smv)
-		if err == ErrStoreEOF || err != nil {
+		if err != nil {
 			break
 		}
 		last = seq - 1
@@ -4704,11 +4719,6 @@ func (mset *stream) startingSequenceForSources() {
 	var state StreamState
 	mset.store.FastState(&state)
 
-	// Bail if no messages, meaning no context.
-	if state.Msgs == 0 {
-		return
-	}
-
 	// For short circuiting return.
 	expected := len(mset.cfg.Sources)
 	seqs := make(map[string]uint64)
@@ -4771,10 +4781,28 @@ func (mset *stream) startingSequenceForSources() {
 		}
 	}
 
+	// Collect known sources state and reuse where possible. This persisted
+	// state survives a full purge/expiry of the destination messages. Otherwise,
+	// we would reset every source back to the origin's beginning.
+	sourcesState := mset.store.SourcesState()
+	for iName := range sources {
+		if sseq, ok := sourcesState[iName]; ok {
+			update(iName, sseq)
+		}
+	}
+	if len(seqs) == expected {
+		return
+	}
+
+	// Bail if no messages, meaning no further context to scan for.
+	if state.Msgs == 0 {
+		return
+	}
+
 	var smv StoreMsg
 	for last := state.LastSeq; ; {
 		sm, seq, err := mset.store.LoadPrevMsgMulti(sl, last, &smv)
-		if err == ErrStoreEOF || err != nil {
+		if err != nil {
 			break
 		}
 		last = seq - 1
