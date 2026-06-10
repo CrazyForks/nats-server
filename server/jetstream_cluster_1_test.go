@@ -7401,8 +7401,8 @@ func TestJetStreamClusterStreamHealthCheckMustNotRecreate(t *testing.T) {
 		require_NotNil(t, err)
 
 		sjs := rs.getJetStream()
-		sjs.mu.RLock()
-		defer sjs.mu.RUnlock()
+		sjs.mu.Lock()
+		defer sjs.mu.Unlock()
 
 		sas := sjs.cluster.streams[globalAccountName]
 		require_True(t, sas != nil)
@@ -7507,8 +7507,8 @@ func TestJetStreamClusterStreamHealthCheckMustNotDeleteEarly(t *testing.T) {
 		require_NotNil(t, err)
 
 		sjs := rs.getJetStream()
-		sjs.mu.RLock()
-		defer sjs.mu.RUnlock()
+		sjs.mu.Lock()
+		defer sjs.mu.Unlock()
 
 		sas := sjs.cluster.streams[globalAccountName]
 		require_True(t, sas != nil)
@@ -7581,8 +7581,8 @@ func TestJetStreamClusterStreamHealthCheckOnlyReportsSkew(t *testing.T) {
 		require_NotNil(t, err)
 
 		sjs := rs.getJetStream()
-		sjs.mu.RLock()
-		defer sjs.mu.RUnlock()
+		sjs.mu.Lock()
+		defer sjs.mu.Unlock()
 
 		sas := sjs.cluster.streams[globalAccountName]
 		require_True(t, sas != nil)
@@ -7684,7 +7684,11 @@ func TestJetStreamClusterConsumerHealthCheckMustNotRecreate(t *testing.T) {
 		t.Helper()
 		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
 			for _, s := range c.servers {
-				if s.getJetStream().consumerAssignment(globalAccountName, "TEST", "CONSUMER") == nil {
+				sjs := s.getJetStream()
+				sjs.mu.RLock()
+				ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+				sjs.mu.RUnlock()
+				if ca == nil {
 					return fmt.Errorf("stream assignment not found on %s", s.Name())
 				}
 			}
@@ -7695,7 +7699,11 @@ func TestJetStreamClusterConsumerHealthCheckMustNotRecreate(t *testing.T) {
 		t.Helper()
 		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
 			for _, s := range c.servers {
-				if s.getJetStream().consumerAssignment(globalAccountName, "TEST", "CONSUMER") != nil {
+				sjs := s.getJetStream()
+				sjs.mu.RLock()
+				ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+				sjs.mu.RUnlock()
+				if ca != nil {
 					return fmt.Errorf("stream assignment still available on %s", s.Name())
 				}
 			}
@@ -7709,8 +7717,8 @@ func TestJetStreamClusterConsumerHealthCheckMustNotRecreate(t *testing.T) {
 		require_NotNil(t, err)
 
 		sjs := rs.getJetStream()
-		sjs.mu.RLock()
-		defer sjs.mu.RUnlock()
+		sjs.mu.Lock()
+		defer sjs.mu.Unlock()
 
 		sas := sjs.cluster.streams[globalAccountName]
 		require_True(t, sas != nil)
@@ -7808,7 +7816,11 @@ func TestJetStreamClusterConsumerHealthCheckMustNotDeleteEarly(t *testing.T) {
 		t.Helper()
 		checkFor(t, 5*time.Second, time.Second, func() error {
 			for _, s := range c.servers {
-				if s.getJetStream().consumerAssignment(globalAccountName, "TEST", "CONSUMER") == nil {
+				sjs := s.getJetStream()
+				sjs.mu.RLock()
+				ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+				sjs.mu.RUnlock()
+				if ca == nil {
 					return fmt.Errorf("stream assignment not found on %s", s.Name())
 				}
 			}
@@ -7823,8 +7835,8 @@ func TestJetStreamClusterConsumerHealthCheckMustNotDeleteEarly(t *testing.T) {
 		o := mset.lookupConsumer("CONSUMER")
 
 		sjs := rs.getJetStream()
-		sjs.mu.RLock()
-		defer sjs.mu.RUnlock()
+		sjs.mu.Lock()
+		defer sjs.mu.Unlock()
 
 		sas := sjs.cluster.streams[globalAccountName]
 		require_True(t, sas != nil)
@@ -7884,7 +7896,11 @@ func TestJetStreamClusterConsumerHealthCheckOnlyReportsSkew(t *testing.T) {
 		t.Helper()
 		checkFor(t, 5*time.Second, time.Second, func() error {
 			for _, s := range c.servers {
-				if s.getJetStream().consumerAssignment(globalAccountName, "TEST", "CONSUMER") == nil {
+				sjs := s.getJetStream()
+				sjs.mu.RLock()
+				ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+				sjs.mu.RUnlock()
+				if ca == nil {
 					return fmt.Errorf("stream assignment not found on %s", s.Name())
 				}
 			}
@@ -7899,8 +7915,8 @@ func TestJetStreamClusterConsumerHealthCheckOnlyReportsSkew(t *testing.T) {
 		o := mset.lookupConsumer("CONSUMER")
 
 		sjs := rs.getJetStream()
-		sjs.mu.RLock()
-		defer sjs.mu.RUnlock()
+		sjs.mu.Lock()
+		defer sjs.mu.Unlock()
 
 		sas := sjs.cluster.streams[globalAccountName]
 		require_True(t, sas != nil)
@@ -11579,7 +11595,11 @@ func TestJetStreamClusterMetaRecoveryRecreateConsumer(t *testing.T) {
 		if newConsumer {
 			// Need to wait for the consumer to be deleted on our selected server.
 			checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
-				if rs.getJetStream().consumerAssignment(globalAccountName, "TEST", "CONSUMER") != nil {
+				sjs := rs.getJetStream()
+				sjs.mu.RLock()
+				ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+				sjs.mu.RUnlock()
+				if ca != nil {
 					return errors.New("still assigned")
 				}
 				return nil
