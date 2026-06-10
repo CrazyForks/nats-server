@@ -1770,7 +1770,6 @@ func (js *jetStream) monitorCluster() {
 				abort(err)
 			} else {
 				// Successful snapshot.
-				lastSnapTime = time.Now()
 				// If there was a failed snapshot before, we reduced the timer's interval.
 				// Reset it back to the original interval now.
 				if failedSnapshots.Load() > 0 {
@@ -1782,6 +1781,7 @@ func (js *jetStream) monitorCluster() {
 						took.Seconds(), nsa, nca, friendlyBytes(csz))
 				}
 				snapMu.Lock()
+				lastSnapTime = time.Now()
 				snapshotting = false
 				snapMu.Unlock()
 			}
@@ -1881,8 +1881,13 @@ func (js *jetStream) monitorCluster() {
 					}
 					if js.hasPeerEntries(ce.Entries) || (didSnap && !isLeader) {
 						doSnapshot(true)
-					} else if nb > compactSizeMin && time.Since(lastSnapTime) > minSnapDelta {
-						doSnapshot(false)
+					} else if nb > compactSizeMin {
+						snapMu.Lock()
+						expired := time.Since(lastSnapTime) > minSnapDelta
+						snapMu.Unlock()
+						if expired {
+							doSnapshot(false)
+						}
 					}
 					recovering = isRecovering
 				} else {
