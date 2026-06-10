@@ -4106,6 +4106,10 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 						entries = bce.Entries
 					}
 					for _, entry := range entries {
+						// Non-normal entries (e.g. EntryCatchup) can be buffered but must be ignored.
+						if entry.Type != EntryNormal {
+							continue
+						}
 						_, _, op, buf, err = decodeBatchMsg(entry.Data[1:])
 						if err != nil {
 							batch.mu.Unlock()
@@ -4136,6 +4140,10 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 				}
 				// Process remaining entries in the current entry.
 				for _, entry := range entries {
+					// Non-normal entries (e.g. EntryCatchup) can be buffered but must be ignored.
+					if entry.Type != EntryNormal {
+						continue
+					}
 					_, _, op, buf, err = decodeBatchMsg(entry.Data[1:])
 					if err != nil {
 						batch.mu.Unlock()
