@@ -2377,7 +2377,9 @@ func (mset *stream) updateWithAdvisory(config *StreamConfig, sendAdvisory bool, 
 					if mset.sources == nil {
 						mset.sources = make(map[string]*sourceInfo)
 					}
+					mset.cfgMu.Lock()
 					mset.cfg.Sources = append(mset.cfg.Sources, s)
+					mset.cfgMu.Unlock()
 
 					var si *sourceInfo
 
@@ -2998,7 +3000,9 @@ func (mset *stream) processInboundMirrorMsg(m *inMsg) bool {
 	if mset.cfg.MirrorDirect && mset.mirrorDirectSub == nil && pending < dgetCaughtUpThresh {
 		if err := mset.subscribeToMirrorDirect(); err != nil {
 			// Disable since we had problems above.
+			mset.cfgMu.Lock()
 			mset.cfg.MirrorDirect = false
+			mset.cfgMu.Unlock()
 		}
 	}
 
