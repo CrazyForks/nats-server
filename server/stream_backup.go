@@ -18,7 +18,8 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"path/filepath"
+	"path"
+	"slices"
 	"strings"
 	"time"
 
@@ -80,6 +81,8 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 		if _, err := tw.Write(buf); err != nil {
 			return err
 		}
+		// Need to wait for flush here as the tar/s2 writer is handing off to a
+		// flow-controlled publisher, it's important that we handle backpressure.
 		return tw.Flush()
 	}
 
@@ -100,7 +103,7 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 			return err
 		}
 		return writeGeneric(
-			filepath.Join("consumers", scs.Name),
+			path.Join("consumers", scs.Name),
 			now.UnixNano(),
 			0,
 			0,
@@ -112,10 +115,15 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 	// If we aren't including consumers here then make sure the consumer count
 	// is set accordingly, this helps on the restore path.
 	var consumerAssignments map[string]*consumerAssignment
+	var consumerStores []ConsumerStore
 	var streamState = *state
 	if !includeConsumers {
 		streamState.Consumers = 0
 	} else if clustered {
+		if sa == nil {
+			errCh <- "stream assignment not present in clustered mode"
+			return
+		}
 		js.mu.RLock()
 		consumerAssignments = make(map[string]*consumerAssignment, len(sa.consumers))
 		for name, ca := range sa.consumers {
@@ -123,6 +131,9 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 		}
 		streamState.Consumers = len(consumerAssignments)
 		js.mu.RUnlock()
+	} else {
+		consumerStores = slices.Collect(store.Consumers())
+		streamState.Consumers = len(consumerStores)
 	}
 
 	ssj, err := json.Marshal(streamState)
@@ -178,10 +189,6 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 		}
 
 		if clustered {
-			if sa == nil {
-				errCh <- "stream assignment not present in clustered mode"
-				return
-			}
 			for _, ca := range consumerAssignments {
 				ci, err := sysRequest[ConsumerInfo](js.srv, clusterConsumerInfoT, sa.Client.serviceAccount(), sa.Config.Name, ca.Name)
 				if err != nil || ci == nil {
@@ -197,7 +204,7 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 				}
 			}
 		} else {
-			for o := range store.Consumers() {
+			for _, o := range consumerStores {
 				config := o.GetConfig()
 				state, err := o.State()
 				if err != nil {
@@ -218,6 +225,9 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 	var sm StoreMsg
 	for seq := state.FirstSeq - 1; seq < state.LastSeq; {
 		if _, seq, err = store.LoadNextMsg(fwcs, true, seq+1, &sm); err != nil {
+			if err == ErrStoreEOF {
+				break
+			}
 			errCh <- fmt.Sprintf("couldn't load next message after seq %d: %s", seq+1, err)
 			return
 		}
@@ -225,6 +235,14 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 			errCh <- err.Error()
 			return
 		}
+	}
+
+	// End of backup sentinel. A clear marker makes it obvious when
+	// a backup has been truncated or not without having to count
+	// messages or from first/last sequence, which may not be possible
+	// during the rewrite of a large stream backup.
+	if err = writeGeneric(_EMPTY_, 0, 0, 0, 0, nil); err != nil {
+		errCh <- err.Error()
 	}
 }
 
@@ -339,13 +357,19 @@ func (a *Account) RestoreStreamV2(ncfg *StreamConfig, r io.Reader) (*stream, err
 
 	store := mset.store
 	lseq := nstate.FirstSeq - 1
-	for range nstate.Msgs {
+	eob := false
+	for {
 		hdr, err := tr.Next()
 		if err != nil {
 			return nil, err
 		}
 		seq := hdr.Sequence
 		if seq == 0 {
+			// Sentinel "end of backup" if all fields are zero.
+			if hdr.Timestamp == 0 && hdr.HeaderSize == 0 && hdr.PayloadSize == 0 {
+				eob = true
+				break
+			}
 			return nil, fmt.Errorf("expected message sequence")
 		}
 		if hdr.HeaderSize < 0 || hdr.PayloadSize < 0 {
@@ -393,7 +417,11 @@ func (a *Account) RestoreStreamV2(ncfg *StreamConfig, r io.Reader) (*stream, err
 		}
 		hdrTime := time.Unix(0, hdr.Timestamp)
 		if ttl > 0 && time.Now().After(hdrTime.Add(time.Duration(ttl)*time.Second)) {
-			// If the TTL has exceeded then there isn't much point in storing the message.
+			// If the TTL has exceeded then there isn't much point in storing the message,
+			// but we still need to preserve the sequence.
+			if err := store.SkipMsgs(seq, 1); err != nil {
+				return nil, fmt.Errorf("failed to process expired message sequence %d: %w", seq, err)
+			}
 			continue
 		}
 		if err = store.StoreRawMsg(subj, mhdr, msg, seq, hdr.Timestamp, ttl, false); err != nil {
@@ -401,9 +429,17 @@ func (a *Account) RestoreStreamV2(ncfg *StreamConfig, r io.Reader) (*stream, err
 		}
 	}
 
-	if _, err := tr.Next(); err != io.EOF {
-		return nil, fmt.Errorf("unexpected trailing entries")
+	if !eob {
+		return mset, fmt.Errorf("backup was truncated")
 	}
 
+	// Need to make sure that we pad out with skip msgs to preserve the last
+	// sequence, otherwise trailing deleted messages could reuse sequence numbers.
+	if lseq < nstate.LastSeq {
+		gap := nstate.LastSeq - lseq
+		if err := store.SkipMsgs(lseq+1, gap); err != nil {
+			return nil, fmt.Errorf("failed to process trailing gap: %w", err)
+		}
+	}
 	return mset, nil
 }

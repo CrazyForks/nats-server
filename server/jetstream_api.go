@@ -3923,6 +3923,7 @@ func (s *Server) processStreamRestore(ci *ClientInfo, acc *Account, cfg *StreamC
 		mset *stream
 		err  error
 	}, 1)
+	var restoreFinished atomic.Bool
 	closeWithError := func(err error) {
 		closeOnce.Do(func() {
 			if err != nil {
@@ -3944,8 +3945,7 @@ func (s *Server) processStreamRestore(ci *ClientInfo, acc *Account, cfg *StreamC
 		tee := io.TeeReader(pr, &consumed)
 		sr := s2.NewReader(tee)
 		var preamble [8]byte
-		var n int
-		if n, err = sr.Read(preamble[:]); err == nil && n == len(preamble) {
+		if _, err = io.ReadFull(sr, preamble[:]); err == nil {
 			replay := io.MultiReader(&consumed, pr)
 			if bytes.Equal(preamble[:], []byte(archive.MagicBytes)) {
 				mset, err = acc.RestoreStreamV2(cfg, replay)
@@ -3953,8 +3953,11 @@ func (s *Server) processStreamRestore(ci *ClientInfo, acc *Account, cfg *StreamC
 				mset, err = acc.RestoreStream(cfg, replay)
 			}
 		}
+		restoreFinished.Store(true)
 		if err != nil {
 			pr.CloseWithError(err)
+		} else {
+			pr.Close()
 		}
 		restoreCh <- struct {
 			mset *stream
@@ -3998,6 +4001,11 @@ func (s *Server) processStreamRestore(ci *ClientInfo, acc *Account, cfg *StreamC
 		activeQ.push(0)
 
 		if _, err := pw.Write(msg); err != nil {
+			if restoreFinished.Load() {
+				activeQ.push(len(msg))
+				s.sendInternalAccountMsg(acc, reply, nil)
+				return
+			}
 			closeWithError(err)
 			sub.client.processUnsub(sub.sid)
 			var resp = JSApiStreamCreateResponse{ApiResponse: ApiResponse{Type: JSApiStreamCreateResponseType}}
@@ -4078,6 +4086,11 @@ func (s *Server) processStreamRestore(ci *ClientInfo, acc *Account, cfg *StreamC
 					s.resourcesExceededError(cfg.Storage)
 				}
 				resp.Error = NewJSStreamRestoreError(err, Unless(err))
+				s.Warnf("Restore failed for %s for stream '%s > %s' in %v",
+					friendlyBytes(int64(total)), acc.Name, streamName, end.Sub(start))
+			} else if mset == nil {
+				err = fmt.Errorf("restore for stream '%s > %s' did not create a stream", acc.Name, streamName)
+				resp.Error = NewJSStreamRestoreError(err)
 				s.Warnf("Restore failed for %s for stream '%s > %s' in %v",
 					friendlyBytes(int64(total)), acc.Name, streamName, end.Sub(start))
 			} else {
@@ -4347,7 +4360,8 @@ func (s *Server) streamSnapshot(acc *Account, mset *stream, sr *SnapshotResult, 
 	chunk := make([]byte, chunkSize)
 	ackTimer := time.NewTimer(snapshotAckTimeout)
 	defer stopAndClearTimer(&ackTimer)
-	for index := 1; ; index++ {
+	// index only incremented when a chunk is actually being sent.
+	for index := 1; ; {
 		select {
 		case <-slots:
 			// A slot has become available.
@@ -4355,7 +4369,12 @@ func (s *Server) streamSnapshot(acc *Account, mset *stream, sr *SnapshotResult, 
 			// The receiver appears to have gone away.
 			hdr = []byte("NATS/1.0 408 No Interest\r\n\r\n")
 			goto done
-		case err := <-sr.errCh:
+		case err, ok := <-sr.errCh:
+			if !ok {
+				// Channel closed normally, e.g. on completion.
+				sr.errCh = nil
+				continue
+			}
 			// The snapshotting goroutine has failed for some reason.
 			hdr = []byte(fmt.Sprintf("NATS/1.0 500 %s\r\n\r\n", err))
 			goto done
@@ -4379,6 +4398,7 @@ func (s *Server) streamSnapshot(acc *Account, mset *stream, sr *SnapshotResult, 
 		}
 		mset.outq.send(newJSPubMsg(reply, _EMPTY_, ackReply, nil, chunk, nil, 0))
 		ackTimer.Reset(snapshotAckTimeout)
+		index++
 	}
 
 done:
