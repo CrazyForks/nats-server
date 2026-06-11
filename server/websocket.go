@@ -475,23 +475,27 @@ func (c *client) wsDecompressAndParse(r *wsReadInfo, b []byte, final bool, mpay 
 		r.coff = 0
 		r.csz = 0
 	}()
-	lr := io.LimitedReader{R: d, N: int64(mpay + 1)}
+	// A single WebSocket message may batch several NATS operations, so the
+	// total decompressed size is capped at the same transport limit used
+	// for the compressed input, not at max_payload, which is enforced per
+	// NATS message by the parser.
+	lr := io.LimitedReader{R: d, N: int64(limit + 1)}
 	buf := make([]byte, 32*1024)
-	total := 0
+	var total uint64
 	for {
 		n, err := lr.Read(buf)
 		if n > 0 {
-			pn := n
-			if total+n > mpay {
-				pn = mpay - total
+			pn := uint64(n)
+			if total+pn > limit {
+				pn = limit - total
 			}
 			if pn > 0 {
 				if err := c.parse(buf[:pn]); err != nil {
 					return err
 				}
 			}
-			total += n
-			if total > mpay {
+			total += uint64(n)
+			if total > limit {
 				return ErrMaxPayload
 			}
 		}

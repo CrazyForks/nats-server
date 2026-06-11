@@ -4900,6 +4900,66 @@ func TestWSDecompressLimit(t *testing.T) {
 	}
 }
 
+func TestWSDecompressBatchAboveMaxPayload(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: "127.0.0.1:-1"
+		websocket {
+			listen: "127.0.0.1:-1"
+			no_tls: true
+			compression: true
+		}
+		max_payload: 4096
+	`))
+	s, o := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	wsc, br, _ := testNewWSClient(t, testWSClientOptions{
+		compress: true,
+		host:     o.Websocket.Host,
+		port:     o.Websocket.Port,
+		noTLS:    true,
+	})
+	defer wsc.Close()
+
+	// Subscribe to "foo" so we can verify that all batched messages
+	// are properly parsed and delivered.
+	sub := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("SUB foo 1\r\n"))
+	if _, err := wsc.Write(sub); err != nil {
+		t.Fatalf("Error sending subscription: %v", err)
+	}
+
+	// Build a single compressed WebSocket message that batches several
+	// PUBs, each individually below max_payload, but whose total
+	// decompressed size exceeds max_payload. This is similar to what the
+	// server's own websocket writer does on compressed leafnode links.
+	const numMsgs = 4
+	msgSize := 2000 // each below max_payload (4096), total above.
+	batch := &bytes.Buffer{}
+	payload := make([]byte, msgSize)
+	for i := range payload {
+		payload[i] = byte('A' + (i % 26))
+	}
+	for i := 0; i < numMsgs; i++ {
+		fmt.Fprintf(batch, "PUB foo %d\r\n", msgSize)
+		batch.Write(payload)
+		batch.WriteString("\r\n")
+	}
+	wsmsg := testWSCreateClientMsg(wsBinaryMessage, 1, true, true, batch.Bytes())
+	if _, err := wsc.Write(wsmsg); err != nil {
+		t.Fatalf("Error sending batched message: %v", err)
+	}
+
+	// We should receive all messages back, not an error/connection close.
+	got := 0
+	for got != numMsgs {
+		msg := testWSReadFrame(t, br)
+		if bytes.Contains(msg, []byte("-ERR")) {
+			t.Fatalf("Expected batched messages to be accepted, got %q", msg)
+		}
+		got += bytes.Count(msg, []byte("MSG foo 1 "))
+	}
+}
+
 func TestWSNoAuthUserOverride(t *testing.T) {
 	o := testWSOptions()
 	// WebSocket has its own no_auth_user override pointing at the lower-
