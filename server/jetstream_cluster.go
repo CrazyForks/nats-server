@@ -7043,7 +7043,7 @@ func (js *jetStream) applyConsumerEntries(o *consumer, ce *CommittedEntry, isLea
 					return err
 				}
 				o.mu.Lock()
-				o.resetLocalStartingSeq(sseq)
+				recalcPending := o.resetLocalStartingSeq(sseq)
 				if o.store != nil {
 					o.store.Reset(sseq - 1)
 				}
@@ -7060,7 +7060,9 @@ func (js *jetStream) applyConsumerEntries(o *consumer, ce *CommittedEntry, isLea
 				if !o.isLeader() {
 					o.mu.Unlock()
 				} else {
-					o.streamNumPending()
+					if recalcPending {
+						o.streamNumPending()
+					}
 					o.signalNewMessages()
 					s, a := o.srv, o.acc
 					if reply == _EMPTY_ {
