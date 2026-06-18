@@ -2708,6 +2708,13 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 			// calling serialize.
 			continue
 		}
+		// A broad wildcard subscription can overlap a subscribe deny clause.
+		c.mu.Lock()
+		denied := c.mperms != nil && c.checkDenySub(string(psub.subject))
+		c.mu.Unlock()
+		if denied {
+			continue
+		}
 		var pi uint16
 		qos := min(mqttGetQoS(rm.Flags), sub.mqtt.qos)
 		if c.mqtt.rejectQoS2Pub && qos == 2 {
@@ -5069,6 +5076,16 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// remove the message, and do nothing else.
 	strippedSubj := subject[len(mqttStreamSubjectPrefix):]
 	if mqttMustIgnoreForReservedSub(sub, strippedSubj) {
+		sess.mu.Unlock()
+		sess.jsa.sendAck(reply)
+		return
+	}
+
+	// A broad wildcard subscription can overlap a subscribe deny clause.
+	cc.mu.Lock()
+	denied := cc.mperms != nil && cc.checkDenySub(strippedSubj)
+	cc.mu.Unlock()
+	if denied {
 		sess.mu.Unlock()
 		sess.jsa.sendAck(reply)
 		return
