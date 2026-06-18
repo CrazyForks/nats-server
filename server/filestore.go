@@ -4852,7 +4852,7 @@ func (fs *fileStore) StoreMsg(subj string, hdr, msg []byte, ttl int64) (uint64, 
 // we will place an empty record marking the sequence as used. The
 // sequence will be marked erased.
 // fs lock should be held.
-func (mb *msgBlock) skipMsg(seq uint64, now int64) {
+func (mb *msgBlock) skipMsg(seq uint64, ts int64) {
 	if mb == nil {
 		return
 	}
@@ -4862,7 +4862,7 @@ func (mb *msgBlock) skipMsg(seq uint64, now int64) {
 	// If we are empty can just do meta.
 	if mb.msgs == 0 {
 		atomic.StoreUint64(&mb.last.seq, seq)
-		mb.last.ts = now
+		mb.last.ts = ts
 		atomic.StoreUint64(&mb.first.seq, seq+1)
 		mb.first.ts = 0
 		needsRecord = mb == mb.fs.lmb
@@ -4871,7 +4871,7 @@ func (mb *msgBlock) skipMsg(seq uint64, now int64) {
 		mb.dmap.Insert(seq)
 	}
 	if needsRecord {
-		mb.writeMsgRecordLocked(emptyRecordLen, seq|ebit, _EMPTY_, nil, nil, now, true, true)
+		mb.writeMsgRecordLocked(emptyRecordLen, seq|ebit, _EMPTY_, nil, nil, ts, true, true)
 	}
 	mb.mu.Unlock()
 	if !needsRecord {
@@ -4881,9 +4881,16 @@ func (mb *msgBlock) skipMsg(seq uint64, now int64) {
 
 // SkipMsg will use the next sequence number but not store anything.
 func (fs *fileStore) SkipMsg(seq uint64) (uint64, error) {
-	// Grab time.
-	now := ats.AccessTime()
+	return fs.skipMsg(seq, false)
+}
 
+// SkipMsgNoInterest will use the next sequence number but not store anything.
+// Unlike SkipMsg it also advances LastTime, which is used for Interest retention.
+func (fs *fileStore) SkipMsgNoInterest(seq uint64) (uint64, error) {
+	return fs.skipMsg(seq, true)
+}
+
+func (fs *fileStore) skipMsg(seq uint64, noInterest bool) (uint64, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
@@ -4901,11 +4908,23 @@ func (fs *fileStore) SkipMsg(seq uint64) (uint64, error) {
 		return 0, err
 	}
 
+	// Only update time if not already set or for Interest retention.
+	var ts int64
+	updateTime := noInterest || fs.state.LastTime.IsZero()
+	if updateTime {
+		ts = ats.AccessTime()
+	} else {
+		ts = fs.state.LastTime.UnixNano()
+	}
+
 	// Write skip msg.
-	mb.skipMsg(seq, now)
+	mb.skipMsg(seq, ts)
 
 	// Update fs state.
-	fs.state.LastSeq, fs.state.LastTime = seq, time.Unix(0, now).UTC()
+	fs.state.LastSeq = seq
+	if updateTime {
+		fs.state.LastTime = time.Unix(0, ts).UTC()
+	}
 	if fs.state.Msgs == 0 {
 		fs.state.FirstSeq, fs.state.FirstTime = seq, time.Time{}
 	}
@@ -4951,14 +4970,19 @@ func (fs *fileStore) SkipMsgs(seq uint64, num uint64) error {
 	}
 
 	// Insert into dmap all entries and place last as marker.
-	now := ats.AccessTime()
+	var ts int64
+	if !fs.state.LastTime.IsZero() {
+		ts = fs.state.LastTime.UnixNano()
+	} else {
+		ts = ats.AccessTime()
+	}
 	lseq := seq + num - 1
 
 	mb.mu.Lock()
 	// If we are empty update meta directly.
 	if mb.msgs == 0 {
 		atomic.StoreUint64(&mb.last.seq, lseq)
-		mb.last.ts = now
+		mb.last.ts = ts
 		atomic.StoreUint64(&mb.first.seq, lseq+1)
 		mb.first.ts = 0
 	} else {
@@ -4967,12 +4991,15 @@ func (fs *fileStore) SkipMsgs(seq uint64, num uint64) error {
 		}
 	}
 	// Write out our placeholder.
-	mb.writeMsgRecordLocked(emptyRecordLen, lseq|ebit, _EMPTY_, nil, nil, now, true, true)
+	mb.writeMsgRecordLocked(emptyRecordLen, lseq|ebit, _EMPTY_, nil, nil, ts, true, true)
 	mb.mu.Unlock()
 
 	// Now update FS accounting.
 	// Update fs state.
-	fs.state.LastSeq, fs.state.LastTime = lseq, time.Unix(0, now).UTC()
+	fs.state.LastSeq = lseq
+	if fs.state.LastTime.IsZero() {
+		fs.state.LastTime = time.Unix(0, ts).UTC()
+	}
 	if fs.state.Msgs == 0 {
 		fs.state.FirstSeq, fs.state.FirstTime = lseq+1, time.Time{}
 	}
