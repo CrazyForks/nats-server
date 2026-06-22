@@ -275,7 +275,6 @@ type catchupState struct {
 type lps struct {
 	ts time.Time // Last timestamp
 	li uint64    // Last index replicated
-	kp bool      // Known peer
 }
 
 type membChange struct {
@@ -2307,7 +2306,7 @@ func (n *raft) Reset() {
 
 	// Reset peer set to just ourselves; a new leader will fold us back into
 	// the cluster's membership view via processPeerState.
-	n.peers = map[string]*lps{n.id: {time.Time{}, 0, true}}
+	n.peers = map[string]*lps{n.id: {time.Time{}, 0}}
 	n.removed = nil
 	n.adjustClusterSizeAndQuorum()
 
@@ -3071,15 +3070,13 @@ func (n *raft) handleForwardedProposal(sub *subscription, c *client, _ *Account,
 // and adjusts cluster size and quorum accordingly.
 // Lock should be held.
 func (n *raft) addPeer(peer string) {
-	if lp, ok := n.peers[peer]; !ok {
-		// We are not tracking this one automatically so we need
-		// to bump cluster size.
-		n.peers[peer] = &lps{time.Time{}, 0, true}
-	} else {
-		// Mark as added.
-		lp.kp = true
+	// Ignore if already exists.
+	if _, ok := n.peers[peer]; ok {
+		return
 	}
-
+	// We are not tracking this one automatically so we need
+	// to bump cluster size.
+	n.peers[peer] = &lps{time.Time{}, 0}
 	// Adjust cluster size and quorum if needed.
 	n.adjustClusterSizeAndQuorum()
 	// Write out our new state.
@@ -3749,12 +3746,7 @@ func (n *raft) trackResponse(ar *appendEntryResponse) bool {
 // Used to adjust cluster size and peer count based on added official peers.
 // lock should be held.
 func (n *raft) adjustClusterSizeAndQuorum() {
-	pcsz, ncsz := n.csz, 0
-	for _, peer := range n.peers {
-		if peer.kp {
-			ncsz++
-		}
-	}
+	pcsz, ncsz := n.csz, len(n.peers)
 	n.csz = ncsz
 	n.qn = n.csz/2 + 1
 
@@ -3785,7 +3777,7 @@ func (n *raft) trackPeer(peer string) error {
 		}
 	}
 	if n.State() == Leader {
-		if lp, ok := n.peers[peer]; !ok || !lp.kp {
+		if _, ok := n.peers[peer]; !ok {
 			// Check if this peer had been removed previously.
 			needPeerAdd = !isRemoved
 		}
@@ -4576,11 +4568,10 @@ func (n *raft) processPeerState(ps *peerState) {
 	n.peers = make(map[string]*lps)
 	for _, peer := range ps.knownPeers {
 		if lp := old[peer]; lp != nil {
-			lp.kp = true
 			n.peers[peer] = lp
 			delete(old, peer)
 		} else {
-			n.peers[peer] = &lps{time.Time{}, 0, true}
+			n.peers[peer] = &lps{time.Time{}, 0}
 		}
 		// If we were on the removed list reverse that here.
 		if n.removed != nil {
@@ -4841,11 +4832,9 @@ func decodePeerState(buf []byte) (*peerState, error) {
 
 // Lock should be held.
 func (n *raft) peerNames() []string {
-	var peers []string
-	for name, peer := range n.peers {
-		if peer.kp {
-			peers = append(peers, name)
-		}
+	peers := make([]string, 0, len(n.peers))
+	for name := range n.peers {
+		peers = append(peers, name)
 	}
 	return peers
 }
