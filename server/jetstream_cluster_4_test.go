@@ -6308,72 +6308,301 @@ func TestJetStreamClusterParallelCreateRaftGroupHighConcurrency(t *testing.T) {
 	require_False(t, sentinelLeft)
 }
 
-func TestJetStreamClusterParallelCreateRaftGroupHAAssetsLimit(t *testing.T) {
+func TestJetStreamClusterParallelCreateMaxHAAssetsLimit(t *testing.T) {
 	const maxAssets = 2
 	tmpl := strings.Replace(jsClusterTempl, "store_dir:", fmt.Sprintf("limits: {max_ha_assets: %d}, store_dir:", maxAssets), 1)
 	c := createJetStreamClusterWithTemplateAndModHook(t, tmpl, "R3S", 3, nil)
 	defer c.shutdown()
 
-	ml := c.leader()
-	sjs := ml.getJetStream()
-	cc := sjs.cluster
-	require_NotNil(t, cc)
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
 
-	acc, err := ml.lookupAccount(globalAccountName)
-	require_NoError(t, err)
-
-	metaPeers := cc.meta.Peers()
-	require_Len(t, len(metaPeers), 3)
-	peers := make([]string, 0, len(metaPeers))
-	for _, p := range metaPeers {
-		peers = append(peers, p.ID)
-	}
-
+	// Fire off many concurrent R3 stream creates. Each R3 stream consumes a HA
+	// asset slot on all three peers, so at most maxAssets of them can be placed.
+	// The meta leader must enforce this authoritatively (accounting for inflight
+	// proposals), so concurrent requests cannot overshoot the limit.
 	const N = 8
 	var (
-		ready sync.WaitGroup
-		start = make(chan struct{})
-		done  sync.WaitGroup
-		mu    sync.Mutex
-		nodes []RaftNode
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		success int
 	)
-	ready.Add(N)
-	done.Add(N)
+	wg.Add(N)
 	for i := range N {
-		rg := &raftGroup{
-			Name:    fmt.Sprintf("RG-%d", i),
-			Storage: FileStorage,
-			Peers:   slices.Clone(peers),
-			Cluster: "R3S",
-		}
-		go func() {
-			defer done.Done()
-			ready.Done()
-			<-start
-			n, _ := sjs.createRaftGroup(acc.GetName(), rg, false, FileStorage, pprofLabels{})
-			if n != nil {
+		go func(i int) {
+			defer wg.Done()
+			_, err := js.AddStream(&nats.StreamConfig{
+				Name:     fmt.Sprintf("S-%d", i),
+				Replicas: 3,
+			})
+			if err == nil {
 				mu.Lock()
-				nodes = append(nodes, n)
+				success++
 				mu.Unlock()
 			}
-		}()
+		}(i)
 	}
-	ready.Wait()
-	close(start)
-	done.Wait()
+	wg.Wait()
 
-	defer func() {
-		mu.Lock()
-		defer mu.Unlock()
-		for _, n := range nodes {
-			n.Stop()
+	// Exactly maxAssets streams should have been created; the rest rejected.
+	require_Equal(t, success, maxAssets)
+
+	// The meta leader's authoritative per-peer counts must not exceed the limit.
+	ml := c.leader()
+	sjs := ml.getJetStream()
+	sjs.mu.Lock()
+	defer sjs.mu.Unlock()
+	for _, n := range sjs.cluster.peerHAAssets {
+		require_True(t, n <= maxAssets)
+	}
+}
+
+func TestJetStreamClusterMaxHAAssetsRebuildAfterLeaderChange(t *testing.T) {
+	const maxAssets = 2
+	tmpl := strings.Replace(jsClusterTempl, "store_dir:", fmt.Sprintf("limits: {max_ha_assets: %d}, store_dir:", maxAssets), 1)
+	c := createJetStreamClusterWithTemplateAndModHook(t, tmpl, "R3S", 3, nil)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	// Fill every peer to the limit with two R3 streams.
+	for _, name := range []string{"S1", "S2"} {
+		_, err := js.AddStream(&nats.StreamConfig{Name: name, Replicas: 3})
+		require_NoError(t, err)
+	}
+
+	// Force a meta leadership change. The new leader must rebuild its per-peer HA
+	// asset counts from applied state and keep enforcing the limit.
+	require_NoError(t, c.leader().getJetStream().getMetaGroup().StepDown())
+	c.waitOnLeader()
+
+	// A third R3 stream must still be rejected by the new leader.
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		_, err := js.AddStream(&nats.StreamConfig{Name: "S3", Replicas: 3})
+		if err == nil {
+			return fmt.Errorf("expected S3 to be rejected, but it was created")
 		}
-	}()
+		if !strings.Contains(err.Error(), "no suitable peers for placement") {
+			return err
+		}
+		return nil
+	})
 
-	mu.Lock()
-	got := len(nodes)
-	mu.Unlock()
-	require_True(t, got <= maxAssets)
+	// Freeing a slot lets a new R3 stream be placed again.
+	require_NoError(t, js.DeleteStream("S1"))
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		_, err := js.AddStream(&nats.StreamConfig{Name: "S3", Replicas: 3})
+		return err
+	})
+}
+
+func TestJetStreamClusterTrackInflightHAAssetAccounting(t *testing.T) {
+	const n1, n2, n3, n4 = "n1", "n2", "n3", "n4"
+
+	type op struct {
+		consumer bool
+		stream   string
+		name     string // consumer name, when consumer is true
+		replicas int    // configured replicas (0 == inherit from stream for a durable consumer)
+		peers    []string
+		deleted  bool
+	}
+	str := func(name string, replicas int, peers ...string) op {
+		return op{stream: name, replicas: replicas, peers: peers}
+	}
+	strDel := func(name string, replicas int, peers ...string) op {
+		return op{stream: name, replicas: replicas, peers: peers, deleted: true}
+	}
+	con := func(stream, name string, replicas int, peers ...string) op {
+		return op{consumer: true, stream: stream, name: name, replicas: replicas, peers: peers}
+	}
+	conDel := func(stream, name string, replicas int, peers ...string) op {
+		return op{consumer: true, stream: stream, name: name, replicas: replicas, peers: peers, deleted: true}
+	}
+
+	for _, test := range []struct {
+		name string
+		ops  []op
+		want map[string]int
+	}{
+		{
+			name: "R1 stream",
+			ops:  []op{str("S", 1, n1)},
+			want: map[string]int{},
+		},
+		{
+			name: "R1 stream with inherited consumer",
+			ops: []op{
+				str("S", 1, n1, n2, n3),
+				con("S", "C", 0, n1, n2, n3),
+			},
+			want: map[string]int{},
+		},
+		{
+			name: "R3 stream",
+			ops:  []op{str("S", 3, n1, n2, n3)},
+			want: map[string]int{n1: 1, n2: 1, n3: 1}, // stream on each peer
+		},
+		{
+			name: "R3 stream with inherited consumer",
+			ops: []op{
+				str("S", 3, n1, n2, n3),
+				con("S", "C", 0, n1, n2, n3),
+			},
+			want: map[string]int{n1: 2, n2: 2, n3: 2}, // stream + consumer on each peer
+		},
+		{
+			name: "R3 stream with inherited consumer delete",
+			ops: []op{
+				str("S", 3, n1, n2, n3),
+				con("S", "C", 0, n1, n2, n3),
+				conDel("S", "C", 0, n1, n2, n3),
+			},
+			want: map[string]int{n1: 1, n2: 1, n3: 1}, // stream on each peer
+		},
+		{
+			name: "R1 to R3 stream",
+			ops: []op{
+				str("S", 1, n1),
+				con("S", "C", 0, n1), // inherits R1, not HA yet
+				str("S", 3, n1, n2, n3),
+				con("S", "C", 0, n1, n2, n3), // consumer grows to match
+			},
+			want: map[string]int{n1: 2, n2: 2, n3: 2},
+		},
+		{
+			name: "R3 to R1 stream",
+			ops: []op{
+				str("S", 3, n1, n2, n3),
+				con("S", "C", 0, n1, n2, n3),
+				str("S", 1, n1), // stream scaled down; consumer now inherits R1, no longer HA
+				conDel("S", "C", 0, n1),
+				strDel("S", 1, n1),
+			},
+			want: map[string]int{},
+		},
+		{
+			name: "R3 stream delete",
+			ops: []op{
+				str("S", 3, n1, n2, n3),
+				con("S", "C", 3, n1, n2, n3), // explicit R3 consumer, never explicitly deleted
+				strDel("S", 3, n1, n2, n3),
+			},
+			want: map[string]int{},
+		},
+		{
+			name: "R3 stream with explicit R1 consumer",
+			ops: []op{
+				str("S", 3, n1, n2, n3),
+				con("S", "C", 1, n1),
+				conDel("S", "C", 1, n1),
+			},
+			want: map[string]int{n1: 1, n2: 1, n3: 1},
+		},
+		{
+			name: "R3 and R2 streams",
+			ops: []op{
+				str("A", 3, n1, n2, n3),
+				str("B", 2, n1, n2),
+			},
+			want: map[string]int{n1: 2, n2: 2, n3: 1},
+		},
+		{
+			name: "R3 and R2 streams with delete",
+			ops: []op{
+				str("A", 3, n1, n2, n3),
+				str("B", 2, n1, n2),
+				strDel("A", 3, n1, n2, n3),
+			},
+			want: map[string]int{n1: 1, n2: 1},
+		},
+		{
+			name: "R3 stream repeated",
+			ops: []op{
+				str("S", 3, n1, n2, n3),
+				str("S", 3, n1, n2, n3),
+			},
+			want: map[string]int{n1: 1, n2: 1, n3: 1},
+		},
+		{
+			name: "R3 consumer repeated",
+			ops: []op{
+				str("S", 3, n1, n2, n3),
+				con("S", "C", 0, n1, n2, n3),
+				con("S", "C", 0, n1, n2, n3),
+			},
+			want: map[string]int{n1: 2, n2: 2, n3: 2},
+		},
+		{
+			name: "R3 stream peer replacement",
+			ops: []op{
+				str("S", 3, n1, n2, n3),
+				str("S", 3, n1, n2, n4),
+			},
+			want: map[string]int{n1: 1, n2: 1, n4: 1}, // n3 dropped, n4 added
+		},
+		{
+			name: "R3 consumer peer replacement",
+			ops: []op{
+				str("S", 4, n1, n2, n3, n4),
+				con("S", "C", 3, n1, n2, n3),
+				con("S", "C", 3, n1, n2, n4),
+			},
+			want: map[string]int{n1: 2, n2: 2, n3: 1, n4: 2}, // consumer's n3 dropped for n4
+		},
+		{
+			name: "R2 to R3 stream with consumer untouched",
+			ops: []op{
+				str("S", 2, n1, n2),
+				con("S", "C", 2, n1, n2),
+				str("S", 3, n1, n2, n3), // stream R changes, but consumer stays R2
+			},
+			want: map[string]int{n1: 2, n2: 2, n3: 1},
+		},
+		{
+			name: "R3 stream delete with multiple consumers",
+			ops: []op{
+				str("S", 3, n1, n2, n3),
+				con("S", "C1", 0, n1, n2, n3),
+				con("S", "C2", 0, n1, n2, n3),
+				strDel("S", 3, n1, n2, n3),
+			},
+			want: map[string]int{},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			js := &jetStream{cluster: &jetStreamCluster{peerHAAssets: map[string]int{}}}
+			cc := js.cluster
+
+			for _, o := range test.ops {
+				if o.consumer {
+					ca := &consumerAssignment{
+						Name:   o.name,
+						Stream: o.stream,
+						Config: &ConsumerConfig{Durable: o.name, Replicas: o.replicas},
+						Group:  &raftGroup{Name: o.name, Peers: o.peers},
+					}
+					js.trackInflightConsumerProposal(globalAccountName, o.stream, ca, o.deleted)
+				} else {
+					sa := &streamAssignment{
+						Config: &StreamConfig{Name: o.stream, Replicas: o.replicas},
+						Group:  &raftGroup{Name: o.stream, Peers: o.peers},
+					}
+					js.trackInflightStreamProposal(globalAccountName, sa, o.deleted)
+				}
+			}
+			// Invariant: only positive counts are ever retained (decrements clamp to deletion).
+			for peer, n := range cc.peerHAAssets {
+				require_True(t, n > 0)
+				require_NotEqual(t, peer, _EMPTY_)
+			}
+			require_Len(t, len(cc.peerHAAssets), len(test.want))
+			for peer, n := range test.want {
+				require_Equal(t, cc.peerHAAssets[peer], n)
+			}
+		})
+	}
 }
 
 func TestJetStreamClusterSubjectDeleteMarkersMinimumTTL(t *testing.T) {
