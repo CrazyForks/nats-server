@@ -4985,9 +4985,8 @@ func (js *jetStream) streamAssignmentOrInflight(account, stream string) *streamA
 		if inflight, ok := streams[stream]; ok {
 			if !inflight.deleted {
 				return inflight.streamAssignment
-			} else {
-				return nil
 			}
+			return nil
 		}
 	}
 
@@ -6537,14 +6536,17 @@ func (js *jetStream) consumerAssignmentOrInflight(account, stream, consumer stri
 	if cc == nil {
 		return nil
 	}
+	// If the stream itself is deleted, the consumer is as well.
+	if js.streamAssignmentOrInflight(account, stream) == nil {
+		return nil
+	}
 	if streams, ok := cc.inflightConsumers[account]; ok {
 		if consumers, ok := streams[stream]; ok {
 			if inflight, ok := consumers[consumer]; ok {
 				if !inflight.deleted {
 					return inflight.consumerAssignment
-				} else {
-					return nil
 				}
+				return nil
 			}
 		}
 	}
@@ -6562,7 +6564,10 @@ func (js *jetStream) consumerAssignmentsOrInflightSeq(account, stream string) it
 		if cc == nil {
 			return
 		}
-
+		// If the stream itself is deleted, the consumer is as well.
+		if js.streamAssignmentOrInflight(account, stream) == nil {
+			return
+		}
 		var inflight map[string]*inflightConsumerInfo
 		if streams, ok := cc.inflightConsumers[account]; ok {
 			inflight = streams[stream]

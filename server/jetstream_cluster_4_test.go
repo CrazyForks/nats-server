@@ -6605,6 +6605,194 @@ func TestJetStreamClusterTrackInflightHAAssetAccounting(t *testing.T) {
 	}
 }
 
+func TestJetStreamClusterTrackInflightAssignmentVisibility(t *testing.T) {
+	type op struct {
+		consumer bool
+		stream   string
+		name     string // consumer name, when consumer is true
+		deleted  bool
+	}
+	str := func(name string) op {
+		return op{stream: name}
+	}
+	strDel := func(name string) op {
+		return op{stream: name, deleted: true}
+	}
+	con := func(stream, name string) op {
+		return op{consumer: true, stream: stream, name: name}
+	}
+	conDel := func(stream, name string) op {
+		return op{consumer: true, stream: stream, name: name, deleted: true}
+	}
+
+	for _, test := range []struct {
+		name string
+		ops  []op
+		// Expected visible streams and, per stream, expected visible consumers.
+		streams   []string
+		consumers map[string][]string
+	}{
+		{
+			name:    "stream visible",
+			ops:     []op{str("S")},
+			streams: []string{"S"},
+		},
+		{
+			// A deleted stream is not returned.
+			name:    "stream deleted",
+			ops:     []op{str("S"), strDel("S")},
+			streams: nil,
+		},
+		{
+			name:      "consumer visible",
+			ops:       []op{str("S"), con("S", "C")},
+			streams:   []string{"S"},
+			consumers: map[string][]string{"S": {"C"}},
+		},
+		{
+			// A deleted consumer is not returned.
+			name:      "consumer deleted",
+			ops:       []op{str("S"), con("S", "C"), conDel("S", "C")},
+			streams:   []string{"S"},
+			consumers: map[string][]string{"S": nil},
+		},
+		{
+			// A consumer for a deleted stream is not returned.
+			name:      "consumer of deleted stream",
+			ops:       []op{str("S"), con("S", "C"), strDel("S")},
+			streams:   nil,
+			consumers: map[string][]string{"S": nil},
+		},
+		{
+			// A non-delete stream update must not hide the stream's consumers.
+			name:      "consumer survives stream update",
+			ops:       []op{str("S"), con("S", "C"), str("S")},
+			streams:   []string{"S"},
+			consumers: map[string][]string{"S": {"C"}},
+		},
+		{
+			// Deleting one stream leaves the other (and its consumer) untouched.
+			name: "delete one of two streams",
+			ops: []op{
+				str("A"), con("A", "CA"),
+				str("B"), con("B", "CB"),
+				strDel("A"),
+			},
+			streams:   []string{"B"},
+			consumers: map[string][]string{"A": nil, "B": {"CB"}},
+		},
+		{
+			// Deleting one consumer leaves its sibling on the same stream.
+			name: "delete one of two consumers",
+			ops: []op{
+				str("S"),
+				con("S", "C1"), con("S", "C2"),
+				conDel("S", "C1"),
+			},
+			streams:   []string{"S"},
+			consumers: map[string][]string{"S": {"C2"}},
+		},
+		{
+			// Re-creating a deleted stream restores its consumer's visibility.
+			name:      "stream recreated restores consumer",
+			ops:       []op{str("S"), con("S", "C"), strDel("S"), str("S")},
+			streams:   []string{"S"},
+			consumers: map[string][]string{"S": {"C"}},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			js := &jetStream{cluster: &jetStreamCluster{peerHAAssets: map[string]int{}}}
+
+			// Collect the universe of names mentioned, so we can also assert that
+			// the ones that should be gone are not returned.
+			allStreams := map[string]struct{}{}
+			allConsumers := map[string]map[string]struct{}{}
+			for _, o := range test.ops {
+				allStreams[o.stream] = struct{}{}
+				if o.consumer {
+					if allConsumers[o.stream] == nil {
+						allConsumers[o.stream] = map[string]struct{}{}
+					}
+					allConsumers[o.stream][o.name] = struct{}{}
+				}
+			}
+
+			for _, o := range test.ops {
+				if o.consumer {
+					ca := &consumerAssignment{
+						Name:   o.name,
+						Stream: o.stream,
+						Config: &ConsumerConfig{Durable: o.name},
+						Group:  &raftGroup{Name: o.name},
+					}
+					js.trackInflightConsumerProposal(globalAccountName, o.stream, ca, o.deleted)
+				} else {
+					sa := &streamAssignment{
+						Config: &StreamConfig{Name: o.stream},
+						Group:  &raftGroup{Name: o.stream},
+					}
+					js.trackInflightStreamProposal(globalAccountName, sa, o.deleted)
+				}
+			}
+
+			wantStreams := map[string]struct{}{}
+			for _, s := range test.streams {
+				wantStreams[s] = struct{}{}
+			}
+
+			// Single-stream lookups for every stream ever mentioned.
+			for s := range allStreams {
+				_, visible := wantStreams[s]
+				require_Equal(t, js.streamAssignmentOrInflight(globalAccountName, s) != nil, visible)
+			}
+
+			// Per-account stream iterator.
+			gotStreams := map[string]struct{}{}
+			for sa := range js.streamAssignmentsOrInflightSeq(globalAccountName) {
+				gotStreams[sa.Config.Name] = struct{}{}
+			}
+			require_Len(t, len(gotStreams), len(wantStreams))
+			for s := range wantStreams {
+				_, ok := gotStreams[s]
+				require_True(t, ok)
+			}
+
+			// All-accounts stream iterator.
+			gotAll := map[string]struct{}{}
+			for accName, sa := range js.streamAssignmentsOrInflightSeqAllAccounts() {
+				require_Equal(t, accName, globalAccountName)
+				gotAll[sa.Config.Name] = struct{}{}
+			}
+			require_Len(t, len(gotAll), len(wantStreams))
+			for s := range wantStreams {
+				_, ok := gotAll[s]
+				require_True(t, ok)
+			}
+
+			// Consumer lookups for every (stream, consumer) ever mentioned.
+			for s, cs := range allConsumers {
+				wantConsumers := map[string]struct{}{}
+				for _, c := range test.consumers[s] {
+					wantConsumers[c] = struct{}{}
+				}
+				for c := range cs {
+					_, visible := wantConsumers[c]
+					require_Equal(t, js.consumerAssignmentOrInflight(globalAccountName, s, c) != nil, visible)
+				}
+				gotConsumers := map[string]struct{}{}
+				for ca := range js.consumerAssignmentsOrInflightSeq(globalAccountName, s) {
+					gotConsumers[ca.Name] = struct{}{}
+				}
+				require_Len(t, len(gotConsumers), len(wantConsumers))
+				for c := range wantConsumers {
+					_, ok := gotConsumers[c]
+					require_True(t, ok)
+				}
+			}
+		})
+	}
+}
+
 func TestJetStreamClusterSubjectDeleteMarkersMinimumTTL(t *testing.T) {
 	for _, storageType := range []StorageType{FileStorage, MemoryStorage} {
 		for _, replicas := range []int{1, 3} {
