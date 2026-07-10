@@ -736,6 +736,26 @@ func TestJetStreamAddStreamOverlapWithJSAPISubjects(t *testing.T) {
 	expectNoErr(acc.addStream(&StreamConfig{Name: "j", Subjects: []string{">"}, NoAck: true}))
 }
 
+func TestJetStreamStreamSetWriteErrIgnoresReadErrors(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	mset, err := s.GlobalAccount().addStream(&StreamConfig{Name: "TEST", Storage: FileStorage})
+	require_NoError(t, err)
+
+	// Read/decode errors surfaced from existing on-disk data are not write
+	// failures and must not disable the stream.
+	for _, rerr := range []error{errNoBlkData, errNoCache, errPartialCache, errCorruptState} {
+		mset.setWriteErr(rerr)
+		require_NoError(t, mset.getWriteErr())
+	}
+
+	// An actual write error should still be recorded.
+	werr := errors.New("write failed")
+	mset.setWriteErr(werr)
+	require_Error(t, mset.getWriteErr(), werr)
+}
+
 func TestJetStreamAddStreamSameConfigOK(t *testing.T) {
 	mconfig := &StreamConfig{
 		Name:     "ok",

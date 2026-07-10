@@ -9351,7 +9351,7 @@ func (mset *stream) setWriteErrLocked(err error) {
 		return
 	}
 	// Ignore non-write errors.
-	if err == ErrStoreClosed {
+	if err == ErrStoreClosed || isReadErr(err) {
 		return
 	}
 	mset.srv.Errorf("JetStream stream '%s > %s' critical write error: %v", mset.acc.Name, mset.cfg.Name, err)
