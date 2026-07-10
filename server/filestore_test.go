@@ -5027,6 +5027,193 @@ func TestFileStoreMissingBlockDataMaxMsgsPerDoesNotDisableStore(t *testing.T) {
 	})
 }
 
+func TestFileStoreTruncateMissingBlockDataDoesNotDisableStore(t *testing.T) {
+	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
+		subj, msg := "foo", []byte("Hello World")
+		// One message per block.
+		fcfg.BlockSize = fileStoreMsgSize(subj, nil, msg)
+		cfg := StreamConfig{Name: "zzz", Subjects: []string{"foo"}, Storage: FileStorage}
+		fs, err := newFileStoreWithCreated(fcfg, cfg, time.Now(), prf(&fcfg), nil)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		// Store five messages, each in their own block.
+		for range 5 {
+			_, _, err = fs.StoreMsg(subj, nil, msg, 0)
+			require_NoError(t, err)
+		}
+
+		// Remove the data file of the block containing seq 3 out-of-band and make
+		// sure its cache and fss are not loaded, so the next access hits the disk.
+		fs.mu.RLock()
+		require_True(t, len(fs.blks) >= 5)
+		mb := fs.blks[2]
+		fs.mu.RUnlock()
+
+		mb.mu.Lock()
+		mb.flushPendingMsgsLocked()
+		mb.closeFDsLockedNoCheck()
+		mb.clearCacheAndOffset()
+		mb.fss = nil
+		mfn := mb.mfn
+		mb.mu.Unlock()
+		require_NoError(t, os.Remove(mfn))
+
+		// Truncating to a sequence in the missing block should reconcile the block
+		// as lost data, write a tombstone to hold the truncated sequence, and must
+		// not fail, which would otherwise permanently disable the store.
+		require_NoError(t, fs.Truncate(3))
+
+		state := fs.State()
+		require_Equal(t, state.FirstSeq, 1)
+		require_Equal(t, state.LastSeq, 3)
+
+		// No write error should have been recorded, and subsequent writes should work.
+		fs.mu.RLock()
+		werr := fs.werr
+		fs.mu.RUnlock()
+		require_NoError(t, werr)
+
+		seq, _, err := fs.StoreMsg(subj, nil, msg, 0)
+		require_NoError(t, err)
+		require_Equal(t, seq, 4)
+
+		// The missing block is rebuilt async, eventually reporting lost data and
+		// reconciling accounting to the two remaining messages plus the new one.
+		checkFor(t, time.Second, 50*time.Millisecond, func() error {
+			state := fs.State()
+			if state.Lost == nil {
+				return errors.New("no lost data reported yet")
+			}
+			if state.Msgs != 3 {
+				return fmt.Errorf("expected 3 msgs, got %d", state.Msgs)
+			}
+			return nil
+		})
+	})
+}
+
+func TestFileStoreTruncateMissingBlockDataToDeletedMsgDoesNotDisableStore(t *testing.T) {
+	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
+		subj, msg := "foo", []byte("Hello World")
+		// Two messages per block.
+		fcfg.BlockSize = 2 * fileStoreMsgSize(subj, nil, msg)
+		cfg := StreamConfig{Name: "zzz", Subjects: []string{"foo"}, Storage: FileStorage}
+		fs, err := newFileStoreWithCreated(fcfg, cfg, time.Now(), prf(&fcfg), nil)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		// Store six messages, two in each block.
+		for i := 0; i < 6; i++ {
+			_, _, err := fs.StoreMsg(subj, nil, msg, 0)
+			require_NoError(t, err)
+		}
+
+		// Remove seq 4, an interior delete tracked by its block's dmap, so
+		// truncating to it short-circuits on the deleted message without loading
+		// the block, and the block only needs to load from disk to truncate.
+		removed, err := fs.RemoveMsg(4)
+		require_NoError(t, err)
+		require_True(t, removed)
+
+		// Remove the data file of the block containing seq 4 out-of-band and make
+		// sure its cache and fss are not loaded, so the next access hits the disk.
+		fs.mu.RLock()
+		require_True(t, len(fs.blks) >= 2)
+		mb := fs.blks[1]
+		fs.mu.RUnlock()
+
+		mb.mu.Lock()
+		mb.flushPendingMsgsLocked()
+		mb.closeFDsLockedNoCheck()
+		mb.clearCacheAndOffset()
+		mb.fss = nil
+		mfn := mb.mfn
+		mb.mu.Unlock()
+		require_NoError(t, os.Remove(mfn))
+
+		// The deleted message means the tombstone is already written before the
+		// block needs to be loaded for truncation. The missing block data should
+		// be reconciled as lost and the block removed, and must not fail, which
+		// would otherwise permanently disable the store.
+		require_NoError(t, fs.Truncate(4))
+
+		state := fs.State()
+		require_Equal(t, state.FirstSeq, 1)
+		require_Equal(t, state.LastSeq, 4)
+
+		// No write error should have been recorded, and subsequent writes should work.
+		fs.mu.RLock()
+		werr := fs.werr
+		fs.mu.RUnlock()
+		require_NoError(t, werr)
+
+		seq, _, err := fs.StoreMsg(subj, nil, msg, 0)
+		require_NoError(t, err)
+		require_Equal(t, seq, 5)
+
+		// The missing block is rebuilt async, eventually reconciling accounting
+		// to the two remaining messages plus the new one.
+		checkFor(t, time.Second, 50*time.Millisecond, func() error {
+			if state := fs.State(); state.Msgs != 3 {
+				return fmt.Errorf("expected 3 msgs, got %d", state.Msgs)
+			}
+			return nil
+		})
+	})
+}
+
+func TestFileStoreExpireMsgsOnRecoverMissingBlockData(t *testing.T) {
+	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
+		subj, msg := "foo", []byte("Hello World")
+		// Two messages per block.
+		fcfg.BlockSize = 2 * fileStoreMsgSize(subj, nil, msg)
+		cfg := StreamConfig{Name: "zzz", Subjects: []string{"foo"}, Storage: FileStorage, MaxAge: time.Hour}
+		fs, err := newFileStoreWithCreated(fcfg, cfg, time.Now(), prf(&fcfg), nil)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		// Store two messages into the same block, the first older than MaxAge and
+		// the second recent, so age expiry has to process the block interior.
+		now := time.Now().UnixNano()
+		require_NoError(t, fs.StoreRawMsg(subj, nil, msg, 1, now-int64(2*time.Hour), 0, false))
+		require_NoError(t, fs.StoreRawMsg(subj, nil, msg, 2, now, 0, false))
+
+		// Remove the block's data file out-of-band and make sure its cache and
+		// fss are not loaded, so the next access hits the disk.
+		fs.mu.RLock()
+		require_True(t, len(fs.blks) >= 1)
+		mb := fs.blks[0]
+		fs.mu.RUnlock()
+
+		mb.mu.Lock()
+		mb.flushPendingMsgsLocked()
+		mb.closeFDsLockedNoCheck()
+		mb.clearCacheAndOffset()
+		mb.fss = nil
+		mfn := mb.mfn
+		mb.mu.Unlock()
+		require_NoError(t, os.Remove(mfn))
+
+		// Expiring on recover should reconcile the missing block data as lost and
+		// remove the block, not fail recovery.
+		fs.mu.Lock()
+		err = fs.expireMsgsOnRecover()
+		fs.mu.Unlock()
+		require_NoError(t, err)
+
+		// No write error should have been recorded, and subsequent writes should work.
+		fs.mu.RLock()
+		werr := fs.werr
+		fs.mu.RUnlock()
+		require_NoError(t, werr)
+
+		seq, _, err := fs.StoreMsg(subj, nil, msg, 0)
+		require_NoError(t, err)
+		require_Equal(t, seq, 3)
+	})
+}
+
 func TestFileStoreAllFilteredStateWithDeleted(t *testing.T) {
 	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
 		fcfg.BlockSize = 1024

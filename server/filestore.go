@@ -2630,6 +2630,15 @@ func (fs *fileStore) expireMsgsOnRecover() error {
 		// If we are here we have to process the interior messages of this blk.
 		// This will load fss as well.
 		if err := mb.loadMsgsWithLock(); err != nil {
+			// If the block data was missing, remove it and continue to the next.
+			if err == errNoBlkData {
+				err = deleteEmptyBlock(mb)
+				mb.mu.Unlock()
+				if err != nil {
+					return err
+				}
+				continue
+			}
 			mb.mu.Unlock()
 			return err
 		}
@@ -10879,6 +10888,7 @@ func (fs *fileStore) Truncate(seq uint64) (rerr error) {
 
 	var hasLsm bool
 	var lastTime int64
+	var removeSmb bool
 	smb := fs.selectMsgBlock(seq)
 	if smb != nil {
 		smb.mu.Lock()
@@ -10889,7 +10899,9 @@ func (fs *fileStore) Truncate(seq uint64) (rerr error) {
 		}
 		smb.finishedWithCache()
 		smb.mu.Unlock()
-		if err != nil && err != ErrStoreMsgNotFound && err != errDeletedMsg {
+		// If the block data was missing, it has been removed in the meantime.
+		removeSmb = err == errNoBlkData
+		if err != nil && err != ErrStoreMsgNotFound && err != errDeletedMsg && err != errNoBlkData {
 			fs.mu.Unlock()
 			return err
 		}
@@ -10916,8 +10928,7 @@ func (fs *fileStore) Truncate(seq uint64) (rerr error) {
 	}
 
 	// The selected message block needs to be removed if it needs to be fully truncated.
-	var removeSmb bool
-	if smb != nil {
+	if smb != nil && !removeSmb {
 		removeSmb = atomic.LoadUint64(&smb.first.seq) > seq
 	}
 
@@ -10994,6 +11005,22 @@ func (fs *fileStore) Truncate(seq uint64) (rerr error) {
 			}
 			err = fs.forceRemoveMsgBlock(smb)
 			smb.mu.Unlock()
+			if err != nil {
+				fs.mu.Unlock()
+				return err
+			}
+			goto SKIP
+		}
+
+		// Make sure we can load the block.
+		if err := smb.loadMsgsWithLock(); err != nil {
+			smb.mu.Unlock()
+			if err == errNoBlkData {
+				if err = fs.writeTombstone(seq, lastTime); err == nil {
+					hasWrittenTombstones = true
+					err = fs.forceRemoveMsgBlock(smb)
+				}
+			}
 			if err != nil {
 				fs.mu.Unlock()
 				return err
