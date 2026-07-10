@@ -5163,6 +5163,62 @@ func TestFileStoreTruncateMissingBlockDataToDeletedMsgDoesNotDisableStore(t *tes
 	})
 }
 
+func TestFileStoreClosedBlockMissingBlockDataDoesNotRebuild(t *testing.T) {
+	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
+		subj, msg := "foo", []byte("Hello World")
+		// One message per block.
+		fcfg.BlockSize = fileStoreMsgSize(subj, nil, msg)
+		cfg := StreamConfig{Name: "zzz", Subjects: []string{"foo"}, Storage: FileStorage}
+		fs, err := newFileStoreWithCreated(fcfg, cfg, time.Now(), prf(&fcfg), nil)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		// Store five messages, each in their own block.
+		for i := 0; i < 5; i++ {
+			_, _, err := fs.StoreMsg(subj, nil, msg, 0)
+			require_NoError(t, err)
+		}
+
+		// Close out and remove the block containing seq 3, but keep it in the block
+		// list, simulating the stale view of a reader racing with block removal.
+		fs.mu.RLock()
+		require_True(t, len(fs.blks) >= 5)
+		mb := fs.blks[2]
+		fs.mu.RUnlock()
+
+		mb.mu.Lock()
+		require_NoError(t, mb.dirtyCloseWithRemove(true))
+		mb.mu.Unlock()
+
+		// Loading messages from the closed block should report the block data
+		// missing without hitting the disk and without rebuilding the block,
+		// the block removal was legitimate so there is no lost data.
+		_, err = fs.LoadMsg(3, nil)
+		require_Error(t, err, ErrStoreMsgNotFound)
+
+		mb.mu.RLock()
+		fseq := atomic.LoadUint64(&mb.first.seq)
+		mb.mu.RUnlock()
+		require_Equal(t, fseq, 3)
+		require_True(t, fs.State().Lost == nil)
+
+		// Scans should skip the closed block and continue.
+		sm, _, err := fs.LoadNextMsg(subj, false, 3, nil)
+		require_NoError(t, err)
+		require_Equal(t, sm.seq, 4)
+
+		// No write error should have been recorded, and writes should still work.
+		fs.mu.RLock()
+		werr := fs.werr
+		fs.mu.RUnlock()
+		require_NoError(t, werr)
+
+		seq, _, err := fs.StoreMsg(subj, nil, msg, 0)
+		require_NoError(t, err)
+		require_Equal(t, seq, 6)
+	})
+}
+
 func TestFileStoreReadPathsMissingBlockDataDoesNotError(t *testing.T) {
 	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
 		subj, msg := "foo", []byte("Hello World")

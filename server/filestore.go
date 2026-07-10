@@ -8598,6 +8598,13 @@ func (mb *msgBlock) loadBlock(buf []byte) ([]byte, error) {
 
 // Lock should be held.
 func (mb *msgBlock) loadMsgsWithLock() error {
+	// If the block was closed it can't be loaded anymore, its data is either
+	// removed or not usable, so report the block data as missing. This also
+	// avoids a spurious rebuild when racing with block removal.
+	if mb.closed {
+		return errNoBlkData
+	}
+
 	if err := mb.checkAndLoadEncryption(); err != nil {
 		return err
 	}
