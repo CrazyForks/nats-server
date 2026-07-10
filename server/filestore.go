@@ -2855,6 +2855,15 @@ loop:
 	return seq
 }
 
+// If the block data was missing it has been reconciled as lost data and the
+// block emptied, so report messages as not found rather than erroring.
+func noBlkDataAsNotFound(err error) error {
+	if err == errNoBlkData {
+		return ErrStoreMsgNotFound
+	}
+	return err
+}
+
 // Find the first matching message against a sublist.
 func (mb *msgBlock) firstMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *StoreMsg) (*StoreMsg, bool, error) {
 	mb.mu.Lock()
@@ -2871,7 +2880,7 @@ func (mb *msgBlock) firstMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *
 	if mb.fssNotLoaded() {
 		// Make sure we have fss loaded.
 		if err := mb.loadMsgsWithLock(); err != nil {
-			return nil, false, err
+			return nil, false, noBlkDataAsNotFound(err)
 		}
 		didLoad = true
 	}
@@ -2952,7 +2961,7 @@ func (mb *msgBlock) firstMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *
 			return true
 		})
 		if ierr != nil {
-			return nil, false, ierr
+			return nil, false, noBlkDataAsNotFound(ierr)
 		}
 		if hseq < uint64(math.MaxUint64) && sm != nil {
 			return sm, didLoad && start == lseq, nil
@@ -2961,7 +2970,7 @@ func (mb *msgBlock) firstMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *
 		// Need messages loaded from here on out.
 		if mb.cacheNotLoaded() {
 			if err := mb.loadMsgsWithLock(); err != nil {
-				return nil, false, err
+				return nil, false, noBlkDataAsNotFound(err)
 			}
 			didLoad = true
 		}
@@ -3013,7 +3022,7 @@ func (mb *msgBlock) firstMatching(filter string, wc bool, start uint64, sm *Stor
 	if mb.fssNotLoaded() {
 		// Make sure we have fss loaded.
 		if err := mb.loadMsgsWithLock(); err != nil {
-			return nil, false, err
+			return nil, false, noBlkDataAsNotFound(err)
 		}
 		didLoad = true
 	}
@@ -3086,12 +3095,12 @@ func (mb *msgBlock) firstMatching(filter string, wc bool, start uint64, sm *Stor
 				}
 			})
 			if ierr != nil {
-				return nil, false, ierr
+				return nil, false, noBlkDataAsNotFound(ierr)
 			}
 		} else if ss, _ := mb.fss.Find(bfilter); ss != nil {
 			if ss.firstNeedsUpdate || ss.lastNeedsUpdate {
 				if err := mb.recalculateForSubj(filter, ss); err != nil {
-					return nil, false, err
+					return nil, false, noBlkDataAsNotFound(err)
 				}
 			}
 			if start <= ss.Last {
@@ -3107,7 +3116,7 @@ func (mb *msgBlock) firstMatching(filter string, wc bool, start uint64, sm *Stor
 	// Need messages loaded from here on out.
 	if mb.cacheNotLoaded() {
 		if err := mb.loadMsgsWithLock(); err != nil {
-			return nil, false, err
+			return nil, false, noBlkDataAsNotFound(err)
 		}
 		didLoad = true
 	}
@@ -3164,7 +3173,7 @@ func (mb *msgBlock) prevMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *S
 	// Need messages loaded from here on out.
 	if mb.cacheNotLoaded() {
 		if err := mb.loadMsgsWithLock(); err != nil {
-			return nil, false, err
+			return nil, false, noBlkDataAsNotFound(err)
 		}
 		didLoad = true
 	}
@@ -3238,7 +3247,7 @@ func (mb *msgBlock) prevMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *S
 			return true
 		})
 		if ierr != nil {
-			return nil, false, ierr
+			return nil, false, noBlkDataAsNotFound(ierr)
 		}
 		if hseq > 0 && sm != nil {
 			return sm, didLoad && start == lseq, nil
@@ -3305,6 +3314,10 @@ func (mb *msgBlock) filteredPendingLocked(filter string, wc bool, sseq uint64) (
 
 	// Make sure we have fss loaded.
 	if err = mb.ensurePerSubjectInfoLoaded(); err != nil {
+		// If the block data was missing, it has been removed in the meantime, so it has nothing pending.
+		if err == errNoBlkData {
+			err = nil
+		}
 		return 0, 0, 0, err
 	}
 
@@ -3315,6 +3328,9 @@ func (mb *msgBlock) filteredPendingLocked(filter string, wc bool, sseq uint64) (
 		if ss, ok := mb.fss.Find(stringToBytes(filter)); ok && ss != nil {
 			if ss.firstNeedsUpdate || ss.lastNeedsUpdate {
 				if err = mb.recalculateForSubj(filter, ss); err != nil {
+					if err == errNoBlkData {
+						err = nil
+					}
 					return 0, 0, 0, err
 				}
 			}
@@ -3347,6 +3363,9 @@ func (mb *msgBlock) filteredPendingLocked(filter string, wc bool, sseq uint64) (
 			}
 		})
 		if err != nil {
+			if err == errNoBlkData {
+				err = nil
+			}
 			return 0, 0, 0, err
 		}
 	}
@@ -3364,6 +3383,9 @@ func (mb *msgBlock) filteredPendingLocked(filter string, wc bool, sseq uint64) (
 	var shouldExpire bool
 	if mb.cacheNotLoaded() {
 		if err = mb.loadMsgsWithLock(); err != nil {
+			if err == errNoBlkData {
+				err = nil
+			}
 			return 0, 0, 0, err
 		}
 		shouldExpire = true
@@ -3708,7 +3730,8 @@ func (fs *fileStore) SubjectsState(subject string) map[string]SimpleState {
 		var shouldExpire bool
 		if mb.fssNotLoaded() {
 			// Make sure we have fss loaded.
-			if err := mb.loadMsgsWithLock(); err != nil {
+			// If the block data was missing, it has been removed in the meantime, skip.
+			if err := mb.loadMsgsWithLock(); err != nil && err != errNoBlkData {
 				mb.mu.Unlock()
 				return nil
 			}
@@ -3785,6 +3808,10 @@ func (fs *fileStore) allLastSeqsLocked() ([]uint64, error) {
 			// Make sure we have fss loaded.
 			if err := mb.loadMsgsWithLock(); err != nil {
 				mb.mu.Unlock()
+				// If the block data was missing, it has been removed in the meantime, skip.
+				if err == errNoBlkData {
+					continue
+				}
 				return nil, err
 			}
 			shouldExpire = true
@@ -3813,6 +3840,10 @@ func (fs *fileStore) allLastSeqsLocked() ([]uint64, error) {
 		mb.finishedWithCache()
 		mb.mu.Unlock()
 		if ierr != nil {
+			// If the block data was missing, it has been removed in the meantime, skip.
+			if ierr == errNoBlkData {
+				continue
+			}
 			return nil, ierr
 		}
 	}
@@ -3914,6 +3945,10 @@ func (fs *fileStore) MultiLastSeqs(filters []string, maxSeq uint64, maxAllowed i
 		var ierr error
 		if ierr = mb.ensurePerSubjectInfoLoaded(); ierr != nil {
 			mb.mu.Unlock()
+			// If the block data was missing, it has been removed in the meantime, skip.
+			if ierr == errNoBlkData {
+				continue
+			}
 			return nil, ierr
 		}
 
@@ -3965,6 +4000,10 @@ func (fs *fileStore) MultiLastSeqs(filters []string, maxSeq uint64, maxAllowed i
 		})
 		mb.mu.Unlock()
 		if ierr != nil {
+			// If the block data was missing, it has been removed in the meantime, skip.
+			if ierr == errNoBlkData {
+				continue
+			}
 			return nil, ierr
 		}
 
@@ -4084,8 +4123,12 @@ func (fs *fileStore) NumPending(sseq uint64, filter string, lastPerSubject bool)
 			// This only should be subjects we know have the last blk in this block.
 			if mb.cacheNotLoaded() {
 				if err = mb.loadMsgsWithLock(); err != nil {
-					mb.mu.Unlock()
-					return 0, 0, err
+					// If the block data was missing, it has been removed in the meantime, skip.
+					if err != errNoBlkData {
+						mb.mu.Unlock()
+						return 0, 0, err
+					}
+					err = nil
 				}
 				shouldExpire = true
 			}
@@ -4147,8 +4190,12 @@ func (fs *fileStore) NumPending(sseq uint64, filter string, lastPerSubject bool)
 			// Make sure we have fss loaded.
 			if mb.fssNotLoaded() {
 				if err = mb.loadMsgsWithLock(); err != nil {
-					mb.mu.Unlock()
-					return 0, 0, err
+					// If the block data was missing, it has been removed in the meantime, skip.
+					if err != errNoBlkData {
+						mb.mu.Unlock()
+						return 0, 0, err
+					}
+					err = nil
 				}
 				shouldExpire = true
 			}
@@ -4179,7 +4226,8 @@ func (fs *fileStore) NumPending(sseq uint64, filter string, lastPerSubject bool)
 					havePartial = true
 				}
 			})
-			if ierr != nil {
+			// If the block data was missing, it has been removed in the meantime, skip.
+			if ierr != nil && ierr != errNoBlkData {
 				mb.mu.Unlock()
 				return 0, 0, ierr
 			}
@@ -4189,8 +4237,12 @@ func (fs *fileStore) NumPending(sseq uint64, filter string, lastPerSubject bool)
 				// Make sure we have the cache loaded.
 				if mb.cacheNotLoaded() {
 					if err = mb.loadMsgsWithLock(); err != nil {
-						mb.mu.Unlock()
-						return 0, 0, err
+						// If the block data was missing, it has been removed in the meantime, skip.
+						if err != errNoBlkData {
+							mb.mu.Unlock()
+							return 0, 0, err
+						}
+						err = nil
 					}
 					shouldExpire = true
 				}
@@ -4265,8 +4317,12 @@ func (fs *fileStore) NumPending(sseq uint64, filter string, lastPerSubject bool)
 				// Make sure we have fss loaded. This loads whole block now.
 				if mb.fssNotLoaded() {
 					if err = mb.loadMsgsWithLock(); err != nil {
-						mb.mu.Unlock()
-						return 0, 0, err
+						// If the block data was missing, it has been removed in the meantime, skip.
+						if err != errNoBlkData {
+							mb.mu.Unlock()
+							return 0, 0, err
+						}
+						err = nil
 					}
 					shouldExpire = true
 				}
@@ -4281,8 +4337,12 @@ func (fs *fileStore) NumPending(sseq uint64, filter string, lastPerSubject bool)
 			// This is the last block. We need to scan per message here.
 			if mb.cacheNotLoaded() {
 				if err = mb.loadMsgsWithLock(); err != nil {
-					mb.mu.Unlock()
-					return 0, 0, err
+					// If the block data was missing, it has been removed in the meantime, skip.
+					if err != errNoBlkData {
+						mb.mu.Unlock()
+						return 0, 0, err
+					}
+					err = nil
 				}
 				shouldExpire = true
 			}
@@ -4425,8 +4485,12 @@ func (fs *fileStore) NumPendingMulti(sseq uint64, sl *gsl.SimpleSublist, lastPer
 			// This only should be subjects we know have the last blk in this block.
 			if mb.cacheNotLoaded() {
 				if err = mb.loadMsgsWithLock(); err != nil {
-					mb.mu.Unlock()
-					return 0, 0, err
+					// If the block data was missing, it has been removed in the meantime, skip.
+					if err != errNoBlkData {
+						mb.mu.Unlock()
+						return 0, 0, err
+					}
+					err = nil
 				}
 				shouldExpire = true
 			}
@@ -4487,8 +4551,12 @@ func (fs *fileStore) NumPendingMulti(sseq uint64, sl *gsl.SimpleSublist, lastPer
 			// Make sure we have fss loaded.
 			if mb.fssNotLoaded() {
 				if err = mb.loadMsgsWithLock(); err != nil {
-					mb.mu.Unlock()
-					return 0, 0, err
+					// If the block data was missing, it has been removed in the meantime, skip.
+					if err != errNoBlkData {
+						mb.mu.Unlock()
+						return 0, 0, err
+					}
+					err = nil
 				}
 				shouldExpire = true
 			}
@@ -4515,7 +4583,8 @@ func (fs *fileStore) NumPendingMulti(sseq uint64, sl *gsl.SimpleSublist, lastPer
 				}
 				return true
 			})
-			if ierr != nil {
+			// If the block data was missing, it has been removed in the meantime, skip.
+			if ierr != nil && ierr != errNoBlkData {
 				mb.mu.Unlock()
 				return 0, 0, ierr
 			}
@@ -4525,8 +4594,12 @@ func (fs *fileStore) NumPendingMulti(sseq uint64, sl *gsl.SimpleSublist, lastPer
 				// Make sure we have the cache loaded.
 				if mb.cacheNotLoaded() {
 					if err = mb.loadMsgsWithLock(); err != nil {
-						mb.mu.Unlock()
-						return 0, 0, err
+						// If the block data was missing, it has been removed in the meantime, skip.
+						if err != errNoBlkData {
+							mb.mu.Unlock()
+							return 0, 0, err
+						}
+						err = nil
 					}
 					shouldExpire = true
 				}
@@ -4611,8 +4684,12 @@ func (fs *fileStore) NumPendingMulti(sseq uint64, sl *gsl.SimpleSublist, lastPer
 				// Make sure we have fss loaded. This loads whole block now.
 				if mb.fssNotLoaded() {
 					if err = mb.loadMsgsWithLock(); err != nil {
-						mb.mu.Unlock()
-						return 0, 0, err
+						// If the block data was missing, it has been removed in the meantime, skip.
+						if err != errNoBlkData {
+							mb.mu.Unlock()
+							return 0, 0, err
+						}
+						err = nil
 					}
 					shouldExpire = true
 				}
@@ -4627,8 +4704,12 @@ func (fs *fileStore) NumPendingMulti(sseq uint64, sl *gsl.SimpleSublist, lastPer
 			// This is the last block. We need to scan per message here.
 			if mb.cacheNotLoaded() {
 				if err = mb.loadMsgsWithLock(); err != nil {
-					mb.mu.Unlock()
-					return 0, 0, err
+					// If the block data was missing, it has been removed in the meantime, skip.
+					if err != errNoBlkData {
+						mb.mu.Unlock()
+						return 0, 0, err
+					}
+					err = nil
 				}
 				shouldExpire = true
 			}
@@ -8872,7 +8953,7 @@ func (fs *fileStore) msgForSeqLocked(seq uint64, sm *StoreMsg, needFSLock bool) 
 
 	fsm, expireOk, err := mb.fetchMsg(seq, sm)
 	if err != nil {
-		return nil, err
+		return nil, noBlkDataAsNotFound(err)
 	}
 
 	// We detected a linear scan and access to the last message.
@@ -9099,6 +9180,11 @@ func (fs *fileStore) loadLastLocked(subj string, sm *StoreMsg) (lsm *StoreMsg, e
 		mb.mu.Lock()
 		if err = mb.ensurePerSubjectInfoLoaded(); err != nil {
 			mb.mu.Unlock()
+			// If the block data was missing, it has been removed in the meantime, skip.
+			if err == errNoBlkData {
+				err = nil
+				continue
+			}
 			return nil, err
 		}
 		// Mark fss activity.
@@ -9113,6 +9199,11 @@ func (fs *fileStore) loadLastLocked(subj string, sm *StoreMsg) (lsm *StoreMsg, e
 					// mb is already loaded into the cache so should be fast-ish.
 					if err = mb.recalculateForSubj(subj, ss); err != nil {
 						mb.mu.Unlock()
+						// If the block data was missing it has been reconciled as lost, skip it.
+						if err == errNoBlkData {
+							err = nil
+							continue
+						}
 						return nil, err
 					}
 				}
@@ -9131,6 +9222,10 @@ func (fs *fileStore) loadLastLocked(subj string, sm *StoreMsg) (lsm *StoreMsg, e
 			if mb.cacheNotLoaded() {
 				if err := mb.loadMsgsWithLock(); err != nil {
 					mb.mu.Unlock()
+					// If the block data was missing it has been reconciled as lost, skip it.
+					if err == errNoBlkData {
+						continue
+					}
 					return nil, err
 				}
 				didLoad = true
@@ -9340,7 +9435,7 @@ func (mb *msgBlock) prevMatching(filter string, wc bool, start uint64, sm *Store
 	var didLoad bool
 	if mb.fssNotLoaded() {
 		if err := mb.loadMsgsWithLock(); err != nil {
-			return nil, false, err
+			return nil, false, noBlkDataAsNotFound(err)
 		}
 		didLoad = true
 	}
@@ -9409,12 +9504,12 @@ func (mb *msgBlock) prevMatching(filter string, wc bool, start uint64, sm *Store
 				last = max(last, min(end, ss.Last))
 			})
 			if ierr != nil {
-				return nil, false, ierr
+				return nil, false, noBlkDataAsNotFound(ierr)
 			}
 		} else if ss, _ := mb.fss.Find(bfilter); ss != nil {
 			if ss.firstNeedsUpdate || ss.lastNeedsUpdate {
 				if err := mb.recalculateForSubj(filter, ss); err != nil {
-					return nil, false, err
+					return nil, false, noBlkDataAsNotFound(err)
 				}
 			}
 			if end >= ss.First {
@@ -9430,7 +9525,7 @@ func (mb *msgBlock) prevMatching(filter string, wc bool, start uint64, sm *Store
 
 	if mb.cacheNotLoaded() {
 		if err := mb.loadMsgsWithLock(); err != nil {
-			return nil, false, err
+			return nil, false, noBlkDataAsNotFound(err)
 		}
 		didLoad = true
 	}
@@ -9979,10 +10074,6 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint
 		t, f, l, err := mb.filteredPendingLocked(subject, wc, atomic.LoadUint64(&mb.first.seq))
 		if err != nil {
 			mb.mu.Unlock()
-			// If the block data was missing, it has been removed in the meantime, skip.
-			if err == errNoBlkData {
-				continue
-			}
 			fs.mu.Unlock()
 			return purged, err
 		}

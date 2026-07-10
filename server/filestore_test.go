@@ -5163,6 +5163,86 @@ func TestFileStoreTruncateMissingBlockDataToDeletedMsgDoesNotDisableStore(t *tes
 	})
 }
 
+func TestFileStoreReadPathsMissingBlockDataDoesNotError(t *testing.T) {
+	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
+		subj, msg := "foo", []byte("Hello World")
+		// One message per block.
+		fcfg.BlockSize = fileStoreMsgSize(subj, nil, msg)
+		cfg := StreamConfig{Name: "zzz", Subjects: []string{"foo"}, Storage: FileStorage}
+		fs, err := newFileStoreWithCreated(fcfg, cfg, time.Now(), prf(&fcfg), nil)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		// Store five messages, each in their own block.
+		for i := 0; i < 5; i++ {
+			_, _, err := fs.StoreMsg(subj, nil, msg, 0)
+			require_NoError(t, err)
+		}
+
+		// Remove the data file of the block containing seq 3 out-of-band and make
+		// sure its cache and fss are not loaded, so the next access hits the disk.
+		fs.mu.RLock()
+		require_True(t, len(fs.blks) >= 5)
+		mb := fs.blks[2]
+		fs.mu.RUnlock()
+
+		mb.mu.Lock()
+		mb.flushPendingMsgsLocked()
+		mb.closeFDsLockedNoCheck()
+		mb.clearCacheAndOffset()
+		mb.fss = nil
+		mfn := mb.mfn
+		mb.mu.Unlock()
+		require_NoError(t, os.Remove(mfn))
+
+		// The missing block data is reconciled as lost, loading the message
+		// reports it as not found rather than erroring.
+		_, err = fs.LoadMsg(3, nil)
+		require_Error(t, err, ErrStoreMsgNotFound)
+
+		// The block is rebuilt async, wait for the lost data to be accounted for.
+		checkFor(t, time.Second, 50*time.Millisecond, func() error {
+			if state := fs.State(); state.Msgs != 4 {
+				return fmt.Errorf("expected 4 msgs, got %d", state.Msgs)
+			}
+			return nil
+		})
+
+		// Scans should skip the lost block and continue, not abort.
+		sm, _, err := fs.LoadNextMsg(subj, false, 3, nil)
+		require_NoError(t, err)
+		require_Equal(t, sm.seq, 4)
+
+		sm, _, err = fs.LoadPrevMsg(subj, false, 3, nil)
+		require_NoError(t, err)
+		require_Equal(t, sm.seq, 2)
+
+		sm, err = fs.LoadLastMsg(subj, nil)
+		require_NoError(t, err)
+		require_Equal(t, sm.seq, 5)
+
+		// Counting scans should skip the lost block, reporting counts consistent
+		// with the reconciled state.
+		total, _, err := fs.NumPending(3, subj, false)
+		require_NoError(t, err)
+		require_Equal(t, total, 2)
+
+		seqs, err := fs.AllLastSeqs()
+		require_NoError(t, err)
+		require_True(t, len(seqs) == 1 && seqs[0] == 5)
+
+		// No write error should have been recorded, and writes should still work.
+		fs.mu.RLock()
+		werr := fs.werr
+		fs.mu.RUnlock()
+		require_NoError(t, werr)
+
+		seq, _, err := fs.StoreMsg(subj, nil, msg, 0)
+		require_NoError(t, err)
+		require_Equal(t, seq, 6)
+	})
+}
+
 func TestFileStoreExpireMsgsOnRecoverMissingBlockData(t *testing.T) {
 	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
 		subj, msg := "foo", []byte("Hello World")
