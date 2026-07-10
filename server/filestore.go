@@ -5099,6 +5099,7 @@ func isReadErr(err error) bool {
 		errors.Is(err, errPriorState) ||
 		errors.Is(err, io.ErrUnexpectedEOF) ||
 		errors.Is(err, errMsgBlkTooBig) ||
+		errors.Is(err, errNoBlkData) ||
 		errors.As(err, &badMsg)
 }
 
