@@ -3766,7 +3766,8 @@ func (fs *fileStore) SubjectsState(subject string) map[string]SimpleState {
 			mb.finishedWithCache()
 		}
 		mb.mu.Unlock()
-		if ierr != nil {
+		// If the block data was missing, it has been removed in the meantime, skip.
+		if ierr != nil && ierr != errNoBlkData {
 			return nil
 		}
 		if mb == stop {
@@ -5748,6 +5749,10 @@ func (fs *fileStore) enforceMsgPerSubjectLimit(fireCallback bool) error {
 		mb.mu.Lock()
 		if err := mb.ensurePerSubjectInfoLoaded(); err != nil {
 			mb.mu.Unlock()
+			// If the block data was missing, it has been removed in the meantime, skip.
+			if err == errNoBlkData {
+				continue
+			}
 			return err
 		}
 		// It isn't safe to intersect mb.fss directly, because removeMsgViaLimits modifies it
@@ -5785,7 +5790,8 @@ func (fs *fileStore) enforceMsgPerSubjectLimit(fireCallback bool) error {
 				}
 			}
 		})
-		if ierr != nil {
+		// If the block data was missing, it has been removed in the meantime, skip.
+		if ierr != nil && ierr != errNoBlkData {
 			return ierr
 		}
 	}
@@ -11107,9 +11113,19 @@ func (fs *fileStore) Truncate(seq uint64) (rerr error) {
 		if err := smb.loadMsgsWithLock(); err != nil {
 			smb.mu.Unlock()
 			if err == errNoBlkData {
-				if err = fs.writeTombstone(seq, lastTime); err == nil {
-					hasWrittenTombstones = true
+				// If the block data was missing, it has been removed in the meantime.
+				// If the message was still found earlier, a tombstone was not written above,
+				// write one now to hold the truncated sequence and timestamp.
+				err = nil
+				if hasLsm {
+					if err = fs.writeTombstone(seq, lastTime); err == nil {
+						hasWrittenTombstones = true
+					}
+				}
+				if err == nil {
+					smb.mu.Lock()
 					err = fs.forceRemoveMsgBlock(smb)
+					smb.mu.Unlock()
 				}
 			}
 			if err != nil {
