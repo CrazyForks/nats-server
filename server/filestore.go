@@ -5448,6 +5448,10 @@ func (fs *fileStore) firstSeqForSubj(subj string) (uint64, error) {
 				mb.mu.Unlock()
 				// Re-acquire fs lock
 				fs.mu.Lock()
+				// If the block data was missing, it has been removed in the meantime, skip.
+				if err == errNoBlkData {
+					continue
+				}
 				return 0, err
 			}
 			shouldExpire = true
@@ -5471,6 +5475,10 @@ func (fs *fileStore) firstSeqForSubj(subj string) (uint64, error) {
 				}
 			}
 			if err != nil {
+				// If the block data was missing, it has been removed in the meantime, skip.
+				if err == errNoBlkData {
+					continue
+				}
 				return 0, err
 			}
 			return ss.First, nil
@@ -5817,6 +5825,10 @@ func (fs *fileStore) removeMsgFromBlock(mb *msgBlock, seq uint64, secure, viaLim
 	if mb.cacheNotLoaded() {
 		if err := mb.loadMsgsWithLock(); err != nil {
 			mb.mu.Unlock()
+			// If the block data was missing, it has been removed in the meantime, skip.
+			if err == errNoBlkData {
+				err = nil
+			}
 			return false, err
 		}
 		didLoad = true
@@ -6092,6 +6104,10 @@ func (mb *msgBlock) compactWithFloor(floor uint64, fsDmap *avl.SequenceSet) erro
 	wasLoaded := mb.cache != nil && mb.cacheAlreadyLoaded()
 	if !wasLoaded {
 		if err := mb.loadMsgsWithLock(); err != nil {
+			// If the block data was missing, it has been removed in the meantime, skip.
+			if err == errNoBlkData {
+				return nil
+			}
 			return err
 		}
 	}
@@ -6238,7 +6254,7 @@ func (mb *msgBlock) compactWithFloor(floor uint64, fsDmap *avl.SequenceSet) erro
 	mb.clearCacheAndOffset()
 	// If we entered with the msgs loaded make sure to reload them.
 	if wasLoaded {
-		if err := mb.loadMsgsWithLock(); err != nil {
+		if err := mb.loadMsgsWithLock(); err != nil && err != errNoBlkData {
 			return err
 		}
 	}
@@ -9953,6 +9969,10 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint
 		t, f, l, err := mb.filteredPendingLocked(subject, wc, atomic.LoadUint64(&mb.first.seq))
 		if err != nil {
 			mb.mu.Unlock()
+			// If the block data was missing, it has been removed in the meantime, skip.
+			if err == errNoBlkData {
+				continue
+			}
 			fs.mu.Unlock()
 			return purged, err
 		}
@@ -9976,6 +9996,10 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint
 		if mb.cacheNotLoaded() {
 			if err := mb.loadMsgsWithLock(); err != nil {
 				mb.mu.Unlock()
+				// If the block data was missing, it has been removed in the meantime, skip.
+				if err == errNoBlkData {
+					continue
+				}
 				fs.mu.Unlock()
 				return 0, err
 			}
@@ -10408,7 +10432,9 @@ func (fs *fileStore) compact(seq uint64) (purged uint64, rerr error) {
 		purged += mb.msgs
 		bytes += mb.bytes
 		// Make sure we do subject cleanup as well.
-		if err := mb.ensurePerSubjectInfoLoaded(); err != nil {
+		// If the block data was missing, it has been removed in the meantime.
+		// fss will be empty, but we still proceed with removing the block below.
+		if err := mb.ensurePerSubjectInfoLoaded(); err != nil && err != errNoBlkData {
 			mb.mu.Unlock()
 			fs.mu.Unlock()
 			return 0, err
@@ -10444,16 +10470,22 @@ func (fs *fileStore) compact(seq uint64) (purged uint64, rerr error) {
 	// Make sure we have the messages loaded.
 	if smb.cacheNotLoaded() {
 		if err = smb.loadMsgsWithLock(); err != nil {
-			smb.mu.Unlock()
-			fs.mu.Unlock()
-			return purged, err
+			if err != errNoBlkData {
+				smb.mu.Unlock()
+				fs.mu.Unlock()
+				return purged, err
+			}
+			// If the block data was missing, it has been removed in the meantime.
+			// The block is now empty and will be cleaned up below.
+			err = nil
+		} else {
+			defer func() {
+				// The lock is released once we get here, so need to re-acquire.
+				smb.mu.Lock()
+				smb.finishedWithCache()
+				smb.mu.Unlock()
+			}()
 		}
-		defer func() {
-			// The lock is released once we get here, so need to re-acquire.
-			smb.mu.Lock()
-			smb.finishedWithCache()
-			smb.mu.Unlock()
-		}()
 	}
 	for mseq := atomic.LoadUint64(&smb.first.seq); mseq < seq; mseq++ {
 		sm, err := smb.cacheLookupNoCopy(mseq, &smv)
@@ -11139,7 +11171,9 @@ func (fs *fileStore) forceRemoveMsgBlock(mb *msgBlock) error {
 func (fs *fileStore) purgeMsgBlock(mb *msgBlock) error {
 	mb.mu.Lock()
 	// Adjust per-subject tracking if present.
-	if err := mb.ensurePerSubjectInfoLoaded(); err != nil {
+	// If the block data was missing, it has been removed in the meantime.
+	// fss will be empty, but we still proceed with removing the block below.
+	if err := mb.ensurePerSubjectInfoLoaded(); err != nil && err != errNoBlkData {
 		mb.mu.Unlock()
 		return err
 	} else if mb.fss != nil {
@@ -11153,25 +11187,30 @@ func (fs *fileStore) purgeMsgBlock(mb *msgBlock) error {
 	}
 	// Clean up scheduled message metadata if we know this block contained any.
 	if fs.scheduling != nil && mb.schedules > 0 {
+		var lerr error
 		if mb.cacheNotLoaded() {
-			if err := mb.loadMsgsWithLock(); err != nil {
+			if lerr = mb.loadMsgsWithLock(); lerr != nil && lerr != errNoBlkData {
 				mb.mu.Unlock()
-				return err
+				return lerr
 			}
 		}
-		var smv StoreMsg
-		fseq, lseq := atomic.LoadUint64(&mb.first.seq), atomic.LoadUint64(&mb.last.seq)
-		for seq := fseq; seq <= lseq; seq++ {
-			sm, err := mb.cacheLookupNoCopy(seq, &smv)
-			if err != nil && err != errDeletedMsg {
-				mb.mu.Unlock()
-				return err
-			}
-			if sm == nil {
-				continue
-			}
-			if schedule, apiErr := getMessageSchedule(sm.hdr); apiErr == nil && !schedule.IsZero() {
-				fs.scheduling.remove(seq)
+		// If the block data was missing, it has been removed in the meantime.
+		// There is no scheduling metadata to clean up, but still proceed with the purge.
+		if lerr == nil {
+			var smv StoreMsg
+			fseq, lseq := atomic.LoadUint64(&mb.first.seq), atomic.LoadUint64(&mb.last.seq)
+			for seq := fseq; seq <= lseq; seq++ {
+				sm, err := mb.cacheLookupNoCopy(seq, &smv)
+				if err != nil && err != errDeletedMsg {
+					mb.mu.Unlock()
+					return err
+				}
+				if sm == nil {
+					continue
+				}
+				if schedule, apiErr := getMessageSchedule(sm.hdr); apiErr == nil && !schedule.IsZero() {
+					fs.scheduling.remove(seq)
+				}
 			}
 		}
 	}

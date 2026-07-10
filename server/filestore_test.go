@@ -4969,6 +4969,64 @@ func TestFileStoreMsgBlkFailOnKernelFaultLostDataReporting(t *testing.T) {
 	})
 }
 
+func TestFileStoreMissingBlockDataMaxMsgsPerDoesNotDisableStore(t *testing.T) {
+	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
+		subj, msg := "foo", []byte("Hello World")
+		// One message per block.
+		fcfg.BlockSize = fileStoreMsgSize(subj, nil, msg)
+		cfg := StreamConfig{Name: "zzz", Subjects: []string{"foo"}, Storage: FileStorage, MaxMsgsPer: 2}
+		fs, err := newFileStoreWithCreated(fcfg, cfg, time.Now(), prf(&fcfg), nil)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		// Store two messages, each in their own block.
+		for range 2 {
+			_, _, err = fs.StoreMsg(subj, nil, msg, 0)
+			require_NoError(t, err)
+		}
+
+		// Remove the first block's data file out-of-band and make sure its cache
+		// and fss are not loaded, so the next access needs to hit the disk.
+		fs.mu.RLock()
+		require_True(t, len(fs.blks) >= 2)
+		mb := fs.blks[0]
+		fs.mu.RUnlock()
+
+		mb.mu.Lock()
+		mb.flushPendingMsgsLocked()
+		mb.closeFDsLockedNoCheck()
+		mb.clearCacheAndOffset()
+		mb.fss = nil
+		mfn := mb.mfn
+		mb.mu.Unlock()
+		require_NoError(t, os.Remove(mfn))
+
+		// This store needs to enforce MaxMsgsPer, which walks the blocks via
+		// firstSeqForSubj and removeMsgViaLimits. The missing block data should
+		// be reconciled as lost data, and must not fail the write, which would
+		// otherwise permanently disable the store and lock up the stream.
+		_, _, err = fs.StoreMsg(subj, nil, msg, 0)
+		require_NoError(t, err)
+
+		// No write error should have been recorded, and subsequent writes should work.
+		fs.mu.RLock()
+		werr := fs.werr
+		fs.mu.RUnlock()
+		require_NoError(t, werr)
+
+		_, _, err = fs.StoreMsg(subj, nil, msg, 0)
+		require_NoError(t, err)
+
+		// The missing block is rebuilt async, eventually reporting lost data.
+		checkFor(t, time.Second, 50*time.Millisecond, func() error {
+			if state := fs.State(); state.Lost == nil {
+				return errors.New("no lost data reported yet")
+			}
+			return nil
+		})
+	})
+}
+
 func TestFileStoreAllFilteredStateWithDeleted(t *testing.T) {
 	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
 		fcfg.BlockSize = 1024
