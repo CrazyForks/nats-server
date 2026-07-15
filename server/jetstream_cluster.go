@@ -9127,6 +9127,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 	}
 
 	if isRetentionChange {
+		// FIXME(mvv): skip desired state if changing an R1 without desired state
 		// Must always register desired state.
 		if rg.Desired == nil {
 			rg = osa.Group.withDesired(rg)
